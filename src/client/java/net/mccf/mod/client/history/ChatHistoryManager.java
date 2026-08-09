@@ -1,5 +1,11 @@
 package net.mccf.mod.client.history;
 
+import com.google.gson.Gson;
+import com.google.gson.GsonBuilder;
+
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.Paths;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Deque;
@@ -9,18 +15,22 @@ import java.util.Map;
 import java.util.UUID;
 
 /**
- * 客户端本地聊天历史记录：内存环形缓冲区，不持久化到磁盘。
+ * 客户端本地聊天历史记录：内存环形缓冲区 + 持久化到磁盘文件。
  *
- * 为什么不落盘：历史记录本质是"这局游戏这次连接期间看到过什么"的临时回溯工具，
- * 类似原版聊天栏的滚动历史（原版也不落盘、重进游戏就没了）。落盘会引入隐私
- * （记录了其他玩家的聊天内容）、多世界/多服务器归属混淆、文件增长清理等一堆
- * 复杂度，收益（跨会话回看）相对这次需求不是必须的——README 和用户明确要的是
- * "字幕淡出后能补看"，不是"跨局存档"。
+ * 1.1.6 起改为持久化：历史记录存到 {@code config/mccf/chat-history.json}，
+ * 重进游戏/重连服务器后保留。之前的"不落盘"设计是为了避免隐私/多服务器归属
+ * 问题，但用户明确要求"重进游戏不丢失"——落盘的收益（跨会话回看）大于成本。
+ *
+ * 为什么参与者名单也要落盘：{@link ConversationRosterManager} 的数据是服务端
+ * 下发的，断开连接后会被清空。如果不落盘参与者名单，重新加载历史记录时
+ * 分组标题（"XX、YY 的对话"）就拿不到参与者名字，退化成"未知对话"。所以
+ * 在 record 时把当时的参与者名单快照存到 {@link #PARTICIPANTS_CACHE}，
+ * 落盘时一起序列化。
  *
  * 为什么用固定容量环形缓冲而不是无限增长的 List：长时间挂机的服务器聊天量可能
- * 很大，无限增长会造成内存泄漏；固定 500 条覆盖"最近发生了什么"的实际需求，
- * 超出后自动丢弃最旧的一条。聊天消息和系统事件分别维护各自的环形缓冲区
- * （各 500 条上限），互不挤占彼此的容量。
+ * 很大，无限增长会造成内存泄漏和磁盘文件膨胀；固定 500 条覆盖"最近发生了什么"
+ * 的实际需求，超出后自动丢弃最旧的一条。聊天消息和系统事件分别维护各自的
+ * 环形缓冲区（各 500 条上限），互不挤占彼此的容量。
  *
  * 线程安全：SubtitlePayload 接收器和 ClientOnlyChatTranslator 的回调都是通过
  * {@code client.execute(...)} 切回客户端主线程后才调用 record，因此这里不需要
@@ -42,6 +52,26 @@ public final class ChatHistoryManager {
 	private static final Deque<ChatHistoryEntry> ENTRIES = new ArrayDeque<>(MAX_ENTRIES);
 	private static final Deque<ChatHistorySystemEvent> SYSTEM_EVENTS = new ArrayDeque<>(MAX_ENTRIES);
 
+	/**
+	 * conversationId → 参与者显示名列表的缓存。在 record 时从
+	 * {@link ConversationRosterManager} 查询并快照存入，落盘时一起序列化。
+	 * 重新加载历史记录时从文件恢复，groupedSnapshot() 优先从这里取名单
+	 * 而非实时查 ConversationRosterManager（后者在断开连接后是空的）。
+	 */
+	private static final Map<UUID, List<String>> PARTICIPANTS_CACHE = new LinkedHashMap<>();
+
+	/** 持久化文件路径。 */
+	private static final Path HISTORY_FILE = Paths.get("config", "mccf", "chat-history.json");
+
+	private static final Gson GSON = new GsonBuilder().setPrettyPrinting().create();
+
+	/** 持久化 JSON 的顶层结构。 */
+	private record PersistData(
+			List<ChatHistoryEntry> entries,
+			List<ChatHistorySystemEvent> systemEvents,
+			Map<UUID, List<String>> participants
+	) {}
+
 	private ChatHistoryManager() {}
 
 	public static synchronized void record(ChatHistoryEntry entry) {
@@ -49,6 +79,20 @@ public final class ChatHistoryManager {
 			ENTRIES.removeFirst();
 		}
 		ENTRIES.addLast(entry);
+
+		// 如果这条消息有 conversationId，把当前的参与者名单快照存到缓存里。
+		// 这样断开连接后 ConversationRosterManager 被清空，重新加载历史时
+		// 仍然能从 PARTICIPANTS_CACHE 取到分组标题需要的参与者名单。
+		if (entry.conversationId() != null) {
+			List<String> names = ConversationRosterManager.get(entry.conversationId()).stream()
+					.map(ConversationRosterManager.RosterEntry::displayName)
+					.toList();
+			if (!names.isEmpty()) {
+				PARTICIPANTS_CACHE.put(entry.conversationId(), names);
+			}
+		}
+
+		saveToFile();
 	}
 
 	public static synchronized void recordSystemEvent(ChatHistorySystemEvent event) {
@@ -56,6 +100,7 @@ public final class ChatHistoryManager {
 			SYSTEM_EVENTS.removeFirst();
 		}
 		SYSTEM_EVENTS.addLast(event);
+		saveToFile();
 	}
 
 	/** 按时间正序返回当前所有聊天消息的快照（不含系统事件；供不需要分组的旧调用方使用）。 */
@@ -222,11 +267,20 @@ public final class ChatHistoryManager {
 			items.sort(java.util.Comparator.comparingLong(ChatTimelineItem::timestampMillis));
 
 			UUID conversationId = e.getKey() instanceof UUID uuid ? uuid : null;
-			List<String> participantNames = conversationId != null
-					? ConversationRosterManager.get(conversationId).stream()
+			// 优先从 PARTICIPANTS_CACHE 取名单（支持持久化后重新加载的场景）；
+			// 如果缓存里没有（比如刚连上服务器、缓存还没更新），实时查
+			// ConversationRosterManager 作为兜底。
+			List<String> participantNames = List.of();
+			if (conversationId != null) {
+				List<String> cached = PARTICIPANTS_CACHE.get(conversationId);
+				if (cached != null && !cached.isEmpty()) {
+					participantNames = cached;
+				} else {
+					participantNames = ConversationRosterManager.get(conversationId).stream()
 							.map(ConversationRosterManager.RosterEntry::displayName)
-							.toList()
-					: List.of();
+							.toList();
+				}
+			}
 
 			long groupStart = items.get(0).timestampMillis();
 			groups.add(new ConversationGroup(conversationId, participantNames, items, groupStart));
@@ -273,9 +327,82 @@ public final class ChatHistoryManager {
 		return new ArrayList<>(names);
 	}
 
-	/** 断开连接时清空——历史记录不跨服务器/世界保留，避免不同服务器的聊天记录混在一起造成误解。 */
+	/**
+	 * 清空所有历史记录并删除持久化文件。
+	 *
+	 * 1.1.6 起 clear() 只在玩家手动点"清空历史"按钮时调用——不再在断开连接时
+	 * 自动清空（因为现在要持久化了）。断开连接时只清 SubtitleManager 和
+	 * ConversationRosterManager 的内存状态，历史记录保留到文件里供下次加载。
+	 */
 	public static synchronized void clear() {
 		ENTRIES.clear();
 		SYSTEM_EVENTS.clear();
+		PARTICIPANTS_CACHE.clear();
+		deleteFile();
+	}
+
+	/**
+	 * 把当前内存里的所有历史记录序列化到 {@code config/mccf/chat-history.json}。
+	 * 每次 record/recordSystemEvent 后调用——聊天消息频率低，写一个小 JSON 文件
+	 * 的开销可忽略。失败时静默忽略——落盘失败不影响内存功能，下次 record 会重试。
+	 */
+	public static synchronized void saveToFile() {
+		try {
+			Files.createDirectories(HISTORY_FILE.getParent());
+			PersistData data = new PersistData(
+					new ArrayList<>(ENTRIES),
+					new ArrayList<>(SYSTEM_EVENTS),
+					new LinkedHashMap<>(PARTICIPANTS_CACHE)
+			);
+			Files.writeString(HISTORY_FILE, GSON.toJson(data));
+		} catch (Exception e) {
+			// 静默忽略——落盘失败不影响内存功能
+		}
+	}
+
+	/**
+	 * 从 {@code config/mccf/chat-history.json} 加载历史记录到内存。
+	 * 在客户端初始化时调用一次。失败时静默忽略——加载失败从空历史开始不影响功能。
+	 */
+	public static synchronized void loadFromFile() {
+		try {
+			if (!Files.exists(HISTORY_FILE)) return;
+			String json = Files.readString(HISTORY_FILE);
+			PersistData data = GSON.fromJson(json, PersistData.class);
+			if (data == null) return;
+
+			ENTRIES.clear();
+			SYSTEM_EVENTS.clear();
+			PARTICIPANTS_CACHE.clear();
+
+			if (data.entries() != null) {
+				for (ChatHistoryEntry e : data.entries()) {
+					if (e == null) continue;
+					if (ENTRIES.size() >= MAX_ENTRIES) break;
+					ENTRIES.addLast(e);
+				}
+			}
+			if (data.systemEvents() != null) {
+				for (ChatHistorySystemEvent e : data.systemEvents()) {
+					if (e == null) continue;
+					if (SYSTEM_EVENTS.size() >= MAX_ENTRIES) break;
+					SYSTEM_EVENTS.addLast(e);
+				}
+			}
+			if (data.participants() != null) {
+				PARTICIPANTS_CACHE.putAll(data.participants());
+			}
+		} catch (Exception e) {
+			// 静默忽略——加载失败从空历史开始不影响功能
+		}
+	}
+
+	/** 删除持久化文件——在 clear() 时调用。失败时静默忽略。 */
+	private static synchronized void deleteFile() {
+		try {
+			Files.deleteIfExists(HISTORY_FILE);
+		} catch (Exception e) {
+			// 静默忽略
+		}
 	}
 }

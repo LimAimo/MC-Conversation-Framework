@@ -81,6 +81,13 @@ jar {
 	from("LICENSE") {
 		rename { "${it}_${project.base.archivesName.get()}" }
 	}
+	// 1.1.6：给 jar 的 MANIFEST.MF 加 Main-Class，双击 jar 时 JVM 会调用
+	// net.mccf.installer.JarDoubleClick.main()，弹一个安装提示窗口。
+	// Fabric Loader 通过 fabric.mod.json 识别 mod，不看 Main-Class，
+	// 所以不影响游戏内加载——玩家把 jar 放进 mods 文件夹后一切照常。
+	manifest {
+		attributes 'Main-Class': 'net.mccf.installer.JarDoubleClick'
+	}
 }
 
 test {

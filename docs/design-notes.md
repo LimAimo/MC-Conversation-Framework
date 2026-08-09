@@ -7,6 +7,80 @@
 
 ---
 
+## 1.1.6　双击 jar 弹窗 + 聊天历史记录大优化
+
+**历史记录持久化的设计变更**：1.1.6 之前 ChatHistoryManager 是纯内存环形缓冲，断开连接即清空。类注释里解释"不落盘是为了避免隐私/多世界归属问题"。用户明确要求"重进游戏不丢失"后，改为持久化到 `config/mccf/chat-history.json`。
+
+**为什么参与者名单也要落盘**：`ConversationRosterManager` 的数据是服务端下发的，断开连接后会被清空。如果不落盘参与者名单，重新加载历史记录时分组标题（"XX、YY 的对话"）拿不到参与者名字，退化成"未知对话"。所以在 `ChatHistoryManager` 里加了 `PARTICIPANTS_CACHE`——record 时从 ConversationRosterManager 查询快照存入，落盘时一起序列化。groupedSnapshot() 优先从缓存取，ConversationRosterManager 实时查询作为兜底。
+
+**为什么断开连接不再清空历史**：1.1.6 之前 DISCONNECT 事件调 `ChatHistoryManager.clear()`。改为持久化后，clear() 只在玩家手动点"清空"按钮时调用。DISCONNECT 仍清 SubtitleManager 和 ConversationRosterManager（它们是服务端实时数据，断连后失效），但不清历史记录——PARTICIPANTS_CACHE 不受 ConversationRosterManager.clear() 影响，分组标题仍能正常显示。
+
+**为什么每次 record 都 saveToFile 而不用防抖**：聊天消息频率低（远低于每秒一条），写一个小 JSON 文件的开销可忽略。防抖增加复杂度但收益不大——500 条历史记录的 JSON 文件大约几十 KB，全量写入在 SSD 上不到 1ms。
+
+**分组标题时间范围用 HH:mm 而非 HH:mm:ss**：分组标题是给玩家一个"这段对话大概在什么时间段"的锚点，秒级精度在标题里太细碎没有意义。每条消息右侧已有 HH:mm:ss 精确时间戳，标题只需要分钟级范围。
+
+**右键复制优先复制译文而非原文**：玩家回看历史时通常是"想复制翻译结果给别人看"。如果没有译文（自己说的话或同语言消息）则复制原文。不弹确认弹窗——复制是轻量操作，弹窗反而打断操作流，玩家直接 Ctrl+V 验证即可。
+
+**导出用 Util.getOperatingSystem().open 而非 AWT Desktop**：和 1.1.5 导出日志打开文件夹同决策——Minecraft 的 Util 跨平台兼容性更好（特别是 Linux），不依赖 AWT。
+
+**清空用 ConfirmScreen 而非直接执行**：清空是不可逆操作（会删除持久化文件），需要二次确认。用 Minecraft 原生的 ConfirmScreen 而非自定义弹窗——确认弹窗是标准化组件，玩家已经习惯它的交互方式。
+
+**长消息 tooltip 的实现方式**：1.21.1 的 EntryListWidget 行高是列表级统一的（不支持每条目自定义高度，1.21.8 才引入），长消息只能截断 + 省略号。tooltip 是在不改变行高的前提下让玩家看到完整内容的唯一方案。实现上用 `hoveredTruncatedText` 字段从 HistoryEntryWidget 传递到 ChatHistoryScreen——因为 tooltip 需要在 Screen 层面调用 `context.drawTooltip()`，而 HistoryEntryWidget 是 static 内部类不能直接访问 Screen 方法。通过 `MinecraftClient.getInstance().currentScreen instanceof ChatHistoryScreen` 获取 Screen 实例设置字段——虽然是个 hack，但每帧只有一个 entry 被 hover，不会出现多 entry 互相覆盖的问题。
+
+**清理幽灵翻译键 mccf.config.chat_history**：0.5.0 版本在主配置界面加过"聊天历史记录"按钮，后来重构配置界面（拆成标签页）时按钮被移除，但翻译键和 ChatHistoryScreen 类注释没同步清理。9 种语言文件都有这个键但代码零引用。1.1.6 清理掉——类注释改为"入口：Esc 暂停菜单按钮 + 独立按键绑定"，翻译键删除。
+
+**右键复制的实现方式——HistoryListWidget 拦截而非 entry.mouseClicked**：最初把右键复制逻辑放在 `HistoryEntryWidget.mouseClicked` 里（检查 `button == 1`），但测试发现右键复制完全不工作。根因是 1.21.1 的 `EntryListWidget.mouseClicked` 只传递左键（`button == 0`）到 entry 来处理选中逻辑——右键根本不会到达 entry 的 mouseClicked 方法。修复方案是在 `HistoryListWidget`（继承自 EntryListWidget）层面覆盖 mouseClicked：先调 super 处理左键选择和滚动条，右键则手动通过 `mouseY - getY() + getScrollAmount()` 计算鼠标落在哪个 entry 上（不依赖 `getEntryAtPosition`——该方法在 1.21.1 Yarn 中是 protected 且名字不确定），找到对应的 HistoryEntryWidget 后调用 `copyToClipboard()`。
+
+**tooltip 换行的实现方式——手动拆行而非依赖 drawTooltip 自动换行**：1.21.1 的 `DrawContext.drawTooltip(TextRenderer, Text, int, int)` 不自动换行——超长消息的 tooltip 会超出屏幕右边界。改用 `drawTooltip(TextRenderer, List<Text>, int, int)` 重载，手动按空格拆词逐词累加，超过 `Math.min(width - 40, 600)` 像素就换行。选 600 作为上限是因为太宽的 tooltip 在小屏幕上仍然会超出——600px 覆盖大多数消息长度，同时保证 1024px 宽度的屏幕上不会溢出。
+
+**参与者筛选不工作的根因——回调缺 rebuildList()**：`participantButton` 的 CyclingButtonWidget 回调只写了 `selectedParticipant = value` 而没有调 `rebuildList()`——sortButton 和 showTranslatedButton 的回调都有 `rebuildList()`，唯独 participantButton 漏了。选了参与者后 `selectedParticipant` 更新了但列表没有重新构建，所以筛选不生效。"全部"选项看起来正常是因为 `selectedParticipant = ""` 时 matchesFilter 不筛选，和列表没重建的效果一样。修复：回调改为 `{ selectedParticipant = value; rebuildList(); }`。
+
+**筛选立即生效的设计——setChangedListener 直接 rebuildList**：之前关键词输入的 `setChangedListener` 只更新 `keywordInput` 但不触发重建，需要按回车或收起面板才生效。改为每次输入直接调 `rebuildList()`——历史记录最多 500 条，重建开销可忽略（远低于每帧级别）。这和"用户希望筛选立即生效"的需求对齐。同时删除了 render 里每帧检查 keywordField 文本变化的冗余逻辑和 keyPressed 里的回车处理——现在都由 setChangedListener 即时处理。
+
+**重置筛选按钮的实现——clearChildren + init 而非逐个重置控件**：`resetFilters()` 把字段值清空后调 `this.clearChildren() + this.init()` 重建所有控件。这比逐个重置控件更可靠——CyclingButtonWidget 的显示状态、source 按钮的 ✓ 前缀、keywordField 的文本都在重建时从字段值读取，不会遗漏。重置按钮在有非默认筛选条件时才可点击（render 里检查 `hasActiveFilter`），避免用户点了没效果。
+
+**组内消息顺序优化——去掉 Collections.reverse**：groupedSnapshot 返回的 items 已经按 timestampMillis 正序排列（从早到晚）。但 rebuildList 和 exportHistory 里都额外调了 `Collections.reverse(items)`，导致组内消息变成从晚到早显示——阅读体验差。去掉 reverse 后组内按时间正序（从早到晚），符合聊天软件的惯例：从上往下读就是时间线推进的方向。分组之间的排序不受影响——TIME_DESC 仍然把最新对话排在最上面，TIME_ASC 把最旧对话排在最上面。
+
+**跳转最新与排序模式联动**：之前 jumpToLatest 无脑滚到底部，但在 TIME_DESC（默认排序）下最新对话排在最上面，滚到底部反而跳到了最旧的对话。修复：TIME_DESC 下滚到顶部（`setScrollAmount(0)`），其他排序模式滚到底部——TIME_ASC 下最新对话在底部，PARTICIPANT_COUNT_DESC / MESSAGE_COUNT_DESC 不按时间排序，"最新"语义不明确，沿用列表底部惯例。
+
+**分组标题样式优化——白色竖线替代绿色背景**：旧版用半透明绿色背景条（`0x5555AA55`）+ 绿色文字（`0x55FF55`），视觉上过于突兀——绿色背景在深色 UI 里占面积大，和消息行的文字风格不协调。改为左侧 2px 白色竖线 + 白色文字：竖线提供视觉分隔（和消息行区分开），白色文字比绿色更中性，不会喧宾夺主。竖线只占 2px 宽度，比背景条干净得多。
+
+**消息双行显示——类似聊天栏的呈现**：旧版单行 `[来源] 说话者: 原文 ⇄ 译文 [源语言→目标语言]` 信息密度太高，长消息容易被截断，读起来也费劲。改为双行：
+- 第一行：`<说话者> 原文` + 右侧时间戳。说话者名字按来源着色（SELF 绿、VISIBLE 白、AUDIBLE 浅灰、CLIENT_ONLY 青），替代旧版的 [来源] 前缀——颜色比文字前缀更直观，也更像原版聊天栏的 `<玩家名> 消息` 格式。原文用白色。
+- 第二行：`⇄ 译文 [源语言→目标语言]`，浅灰色缩进显示。只有有译文时才画第二行，没译文的行（自己说话或同语言）第二行留空，不影响阅读。
+
+**为什么 ITEM_HEIGHT 从 12 改为 20**：双行文字需要两行 9px = 18px + 上下各 1px padding = 20px。1.21.1 的 EntryListWidget itemHeight 是列表级的（不支持每条目自定义高度，那是 1.21.8 才引入的），所以 GroupTitleWidget 和 SystemEventWidget 也变成 20px——它们在 20px 里居中单行文字即可，不影响显示效果。
+
+**导出格式同步改为双行**：界面和导出保持一致的呈现，方便玩家对照。第一行 `[时间] <说话者> 原文`，第二行缩进 `⇄ 译文 [源语言→目标语言]`。去掉了旧版的 [来源] 标签（和界面一致，用颜色区分来源而不是文字标签）。
+
+**排序选项改名——TIME_DESC 从"最新在前"改为"默认"**：TIME_DESC 是初始排序模式，也是大多数玩家会一直用的排序。叫"最新在前"描述的是行为，叫"默认"描述的是状态——玩家看到"默认"就知道这是推荐选项，不需要理解"最新在前"是什么意思。其他排序选项保持描述性命名（"最早在前"、"消息最多"、"人数最多"），和"默认"形成对比。
+
+**筛选面板空白优化——高度从 104px 到 60px**：面板只有 3 行控件（行1 来源+重置 16px、行2 参与者+排序 16px、行3 关键词+显示译文 16px），实际占用约 60px，但 FILTER_PANEL_HEIGHT 设为 104px 导致行3 下方有 44px 空白。收紧到 60px 后，展开面板时列表区域多出 44px 显示空间。
+
+**无译文消息行垂直居中——缓解固定行高的空旷感**：用户反馈"选中消息的框调小了翻译溢出，调大了太空旷"。根因是 1.21.1 的 EntryListWidget itemHeight 是列表级统一的（不支持每条目自定义高度，1.21.8 才引入），有译文的双行需要 20px，无译文的单行也是 20px——单行文字顶在 y+2 时下方留一大片空白。无法逐条变高，但可以让无译文行的文字垂直居中（`y + (entryHeight - fontHeight) / 2`），视觉上不那么空旷。有译文行保持 y+2 / y+11 双行布局不变。选中高亮框是 AlwaysSelectedEntryListWidget 父类按 itemHeight 统一绘制的矩形，无法单独调整——这是 1.21.1 的硬性限制，要彻底解决需要升级到 1.21.8+ 的 per-entry height API。
+
+**系统提示缩小到 0.85 倍——辅助信息不应和正文一样大**：用户反馈"开始了一段新对话"提示太大。它是分隔性辅助信息（标记一个新对话组的开始），不是消息内容，和正文同字号会喧宾夺主。缩小到 0.85 倍后既能保留可读性，又在视觉层次上明确低于消息正文。用 `context.getMatrices().scale()` 缩放后重新计算居中坐标（除以 scale 还原到缩放后的坐标系），保持水平垂直居中。
+
+**对话大标题从 1.3 倍降到 1.1 倍**：用户反馈大标题太大。1.3 倍字号在 20px 行高里显得头重脚轻（缩放后字高约 11.7px，占行高一半以上，和下方消息行视觉差距过大）。1.1 倍既能和正文形成层次区分（标题略大于正文表明"这是一个分组标题"），又不会过于突兀。配合左侧白色竖线，1.1 倍字号 + 白色文字已经足够建立视觉层次。
+
+---
+
+## 1.1.6（续）　双击 jar 弹窗安装提示
+
+**为什么需要这个功能**：很多新玩家下载 jar 后会双击试图"安装"或"运行"，结果只看到 JVM 报错（如 "no main manifest attribute" 或 "could not find or load main class"），完全不知道该怎么办。一个友好的弹窗能省掉大量"我不会装"的咨询，也降低玩家对"这东西是不是坏了"的疑虑。
+
+**为什么不依赖 Minecraft/Fabric**：双击 jar 时 JVM 直接调 main 方法，此时 Fabric Loader 还没介入、Minecraft 类不在 classpath 上。这个类只能用 JDK 自带的 Swing/AWT。Fabric Loader 通过 fabric.mod.json 识别 mod，完全不看 MANIFEST.MF 的 Main-Class，所以加这个入口不影响游戏内加载——玩家把 jar 放进 mods 文件夹后一切照常。
+
+**为什么翻译硬编码在 Map 里而不是读语言文件**：`assets/mccf/lang/*.json` 是给 Minecraft 的 `Text.translatable()` 用的，需要 Minecraft 的资源加载管线。双击 jar 时没有这条管线，只能自己管理翻译。硬编码 9 种语言 + 英文 fallback 覆盖项目已支持的所有语言。如果未来加新语言，需要同时更新 `assets/mccf/lang/*.json`（游戏内用）和 `JarDoubleClick.TRANSLATIONS`（双击弹窗用）——两套翻译是独立的，没有共享数据源。
+
+**为什么用 Desktop.browse 而非 Minecraft 的 Util.getOperatingSystem().open()**：双击 jar 时没有 Minecraft 上下文，Util 类不在 classpath 上。Desktop API 是 JDK 自带的跨平台方案，在 Windows/macOS/Linux 都可用。失败时静默忽略——玩家可以手动复制 URL，弹窗文字里已有路径提示。
+
+**为什么用系统原生 look and feel 而非 Java 默认**：玩家对"看起来像系统弹窗"的信任度高于"看起来像 Java 程序"——后者容易让人误以为是病毒或恶意软件。`UIManager.setLookAndFeel(UIManager.getSystemLookAndFeelClassName())` 让弹窗用 Windows/macOS/Linux 原生窗口样式。
+
+**为什么用 showOptionDialog 而非 showMessageDialog**：需要两个按钮（"打开教程" + "确定"），showMessageDialog 只有一个按钮。showOptionDialog 可以自定义按钮文字和顺序，第一个按钮（"打开教程"）返回 0，第二个按钮（"确定"）返回 1，点关闭按钮（X）返回 -1 视为"确定"不打开浏览器。
+
+---
+
 ## 1.1.5　权限状态机 + Mock 警告 + 导出日志打开文件夹
 
 **权限状态机设计**：服务端配置标签页的可见性分三档——HIDDEN（完全隐藏标签）、READ_ONLY（显示但灰色 + 黄色横幅）、EDITABLE（正常可编辑）。判断顺序：

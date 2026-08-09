@@ -12,7 +12,7 @@
 		"issues": "https://github.com/VirTuaL-EnTitY/MC-Conversation-Framework-1.21.1/issues",
 		"sources": "https://github.com/VirTuaL-EnTitY/MC-Conversation-Framework-1.21.1"
 	},
-	"license": "MIT",
+	"license": "Apache-2.0",
 	"icon": "assets/mccf/icon.png",
 	"environment": "*",
 	"entrypoints": {

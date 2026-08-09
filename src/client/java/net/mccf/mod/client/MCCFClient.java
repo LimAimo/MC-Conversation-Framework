@@ -75,6 +75,10 @@ public class MCCFClient implements ClientModInitializer {
 		ClientOnlyModeManager.load();
 		ClientOnlyChatTranslator.register();
 
+		// 1.1.6：聊天历史记录持久化——从 config/mccf/chat-history.json 加载上次的历史，
+		// 重进游戏/重连服务器后保留。详见 ChatHistoryManager 类注释。
+		net.mccf.mod.client.history.ChatHistoryManager.loadFromFile();
+
 		// 0.16.0 起 VISIBLE 模式走原版聊天栏（不再有世界空间渲染器），客户端只需要
 		// 注册 AUDIBLE 模式的 HUD 渲染器。WorldRenderEvents.AFTER_ENTITIES 的注册
 		// 已随 WorldSubtitleRenderer 一并移除——见本类 Javadoc 的决策历史说明。
@@ -246,11 +250,13 @@ public class MCCFClient implements ClientModInitializer {
 			}
 		});
 
-		// 断开连接时清空本地字幕状态 + 聊天历史 + 对话名单 + 重置模式检测结果，
-		// 避免残留到下一局/下一个服务器。
+		// 断开连接时清空本地字幕状态 + 对话名单 + 重置模式检测结果。
+		// 1.1.6 起不再清空 ChatHistoryManager——历史记录现在持久化到文件，
+		// 断开连接后保留，重连/重进游戏后可以回看。ConversationRosterManager
+		// 仍要清空（它是服务端下发的实时数据，断连后失效），但 ChatHistoryManager
+		// 里缓存的参与者名单（PARTICIPANTS_CACHE）不受影响，分组标题仍能正常显示。
 		ClientPlayConnectionEvents.DISCONNECT.register((handler, client) -> {
 			SubtitleManager.clear();
-			net.mccf.mod.client.history.ChatHistoryManager.clear();
 			net.mccf.mod.client.history.ConversationRosterManager.clear();
 			ClientOnlyModeManager.onDisconnect();
 		});

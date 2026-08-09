@@ -5,6 +5,80 @@
 
 ---
 
+## 1.1.6　Double-click jar popup + Chat history major optimization
+
+**History persistence design change**: Before 1.1.6, ChatHistoryManager was a pure in-memory ring buffer cleared on disconnect. Class docs explained "not persisting to avoid privacy/multi-world ownership issues". After user explicitly requested "don't lose on restart", changed to persist to `config/mccf/chat-history.json`.
+
+**Why participant names also need persisting**: `ConversationRosterManager` data is server-pushed, cleared on disconnect. If participant names aren't persisted, reloaded history's group titles ("XX, YY's conversation") can't get participant names, degrading to "unknown conversation". So added `PARTICIPANTS_CACHE` in `ChatHistoryManager` — snapshots from ConversationRosterManager at record time, serialized together. groupedSnapshot() reads from cache first, falls back to live ConversationRosterManager query.
+
+**Why disconnect no longer clears history**: Before 1.1.6, DISCONNECT event called `ChatHistoryManager.clear()`. After persistence, clear() is only called when player manually clicks "Clear" button. DISCONNECT still clears SubtitleManager and ConversationRosterManager (server real-time data, invalid after disconnect), but not history — PARTICIPANTS_CACHE is unaffected by ConversationRosterManager.clear(), group titles still display correctly.
+
+**Why saveToFile on every record instead of debounce**: Chat message frequency is low (far below 1/sec), writing a small JSON file's overhead is negligible. Debounce adds complexity with little benefit — 500 entries' JSON file is tens of KB, full write takes <1ms on SSD.
+
+**Group title time range uses HH:mm not HH:mm:ss**: Group title gives player a "what time period was this conversation" anchor, second-level precision is too granular for titles. Each message already has HH:mm:ss timestamp on the right, title only needs minute-level range.
+
+**Right-click copy prefers translation over original**: Player reviewing history usually wants to "copy translation result to share with others". If no translation (self-talk or same-language message), copies original. No confirmation popup — copy is lightweight, popup interrupts flow, player verifies with Ctrl+V.
+
+**Export uses Util.getOperatingSystem().open instead of AWT Desktop**: Same decision as 1.1.5 export log open folder — Minecraft's Util has better cross-platform compatibility (especially Linux), doesn't depend on AWT.
+
+**Clear uses ConfirmScreen instead of direct execution**: Clear is irreversible (deletes persistence file), needs secondary confirmation. Using Minecraft's native ConfirmScreen rather than custom popup — confirmation dialog is a standardized component players are familiar with.
+
+**Long message tooltip implementation**: 1.21.1's EntryListWidget row height is list-level uniform (no per-entry custom height until 1.21.8), long messages can only be truncated + ellipsis. Tooltip is the only way to show full content without changing row height. Implementation uses `hoveredTruncatedText` field passed from HistoryEntryWidget to ChatHistoryScreen — because tooltip needs Screen-level `context.drawTooltip()` call, and HistoryEntryWidget is a static inner class that can't directly access Screen methods. Gets Screen instance via `MinecraftClient.getInstance().currentScreen instanceof ChatHistoryScreen` — though a hack, only one entry is hovered per frame, no multi-entry overwrite issue.
+
+**Cleaning ghost translation key mccf.config.chat_history**: Version 0.5.0 added a "Chat History" button in main config screen, later removed during config UI refactor (split into tabs), but translation key and ChatHistoryScreen class docs weren't cleaned up. All 9 language files had this key with zero code references. 1.1.6 cleaned it up — class docs changed to "entry: Esc pause menu button + independent keybinding", translation key deleted.
+
+**Right-click copy implementation — HistoryListWidget intercepts instead of entry.mouseClicked**: Initially put right-click copy logic in `HistoryEntryWidget.mouseClicked` (checking `button == 1`), but testing showed it didn't work at all. Root cause: 1.21.1's `EntryListWidget.mouseClicked` only passes left click (`button == 0`) to entry for selection logic — right click never reaches entry's mouseClicked method. Fix: override mouseClicked in `HistoryListWidget` (extends EntryListWidget): call super first for left click/scrollbar, then for right click manually calculate which entry the mouse is on via `mouseY - getY() + getScrollAmount()` (not using `getEntryAtPosition` — that method is protected in 1.21.1 Yarn with uncertain name), find corresponding HistoryEntryWidget and call `copyToClipboard()`.
+
+**Tooltip line wrapping — manual splitting instead of relying on drawTooltip auto-wrap**: 1.21.1's `DrawContext.drawTooltip(TextRenderer, Text, int, int)` doesn't auto-wrap — extra-long message tooltips exceed screen right edge. Switched to `drawTooltip(TextRenderer, List<Text>, int, int)` overload, manually splitting by spaces word-by-word, wrapping when exceeding `Math.min(width - 40, 600)` pixels. 600 as upper limit because wider tooltips still overflow on small screens — 600px covers most message lengths while guaranteeing no overflow on 1024px-wide screens.
+
+**Participant filter not working root cause — callback missing rebuildList()**: `participantButton`'s CyclingButtonWidget callback only had `selectedParticipant = value` without calling `rebuildList()` — sortButton and showTranslatedButton callbacks both had `rebuildList()`, only participantButton missed it. After selecting a participant, `selectedParticipant` updated but list wasn't rebuilt, so filter didn't apply. "All" option appeared normal because `selectedParticipant = ""` means no filtering in matchesFilter, same effect as not rebuilding. Fix: callback changed to `{ selectedParticipant = value; rebuildList(); }`.
+
+**Immediate filter application design — setChangedListener calls rebuildList directly**: Previously keyword input's `setChangedListener` only updated `keywordInput` without triggering rebuild — required pressing Enter or collapsing panel to take effect. Changed to call `rebuildList()` on every input — max 500 history entries, rebuild overhead negligible (far below per-frame level). Aligns with "user wants filters to take effect immediately". Also removed redundant per-frame keywordField text change check in render and Enter handling in keyPressed — now all handled immediately by setChangedListener.
+
+**Reset filter button implementation — clearChildren + init instead of resetting controls individually**: `resetFilters()` clears field values then calls `this.clearChildren() + this.init()` to rebuild all controls. More reliable than resetting controls individually — CyclingButtonWidget display state, source button ✓ prefix, keywordField text all read from field values during rebuild, nothing missed. Reset button only clickable when non-default filter conditions exist (render checks `hasActiveFilter`), avoiding no-op clicks.
+
+**Intra-group message order optimization — removed Collections.reverse**: groupedSnapshot returns items already sorted by timestampMillis ascending (earliest to latest). But rebuildList and exportHistory both called `Collections.reverse(items)`, making intra-group messages display latest to earliest — poor reading experience. After removing reverse, intra-group is chronological (earliest to latest), matching chat software convention: reading top-to-bottom follows timeline progression. Inter-group ordering unaffected — TIME_DESC still puts latest conversation on top, TIME_ASC puts oldest on top.
+
+**Jump-to-latest linked with sort mode**: Previously jumpToLatest always scrolled to bottom, but under TIME_DESC (default sort) the latest conversation is at the top — scrolling to bottom jumps to the oldest conversation instead. Fix: scroll to top under TIME_DESC (`setScrollAmount(0)`), scroll to bottom for other modes — TIME_ASC has latest at bottom, PARTICIPANT_COUNT_DESC / MESSAGE_COUNT_DESC don't sort by time so "latest" is ambiguous, following bottom-of-list convention.
+
+**Group title style — white sidebar replaces green background**: Old version used semi-transparent green background bar (`0x5555AA55`) + green text (`0x55FF55`), visually too intrusive — green background covers large area in dark UI, clashes with message line text style. Changed to 2px white sidebar on left + white text: sidebar provides visual separation (distinguishes from message lines), white text is more neutral than green, doesn't steal attention. Sidebar only 2px wide, much cleaner than background bar.
+
+**Message dual-line display — chat-bar style presentation**: Old single-line `[Source] Speaker: Original ⇄ Translation [sourceLang→targetLang]` had too high information density, long messages easily truncated, hard to read. Changed to dual-line:
+- Line 1: `<Speaker> Original` + right-aligned timestamp. Speaker name colored by source (SELF green, VISIBLE white, AUDIBLE light gray, CLIENT_ONLY cyan), replacing old [Source] prefix — color is more intuitive than text prefix, also closer to vanilla chat bar's `<PlayerName> message` format. Original text in white.
+- Line 2: `⇄ Translation [sourceLang→targetLang]`, light gray indented. Only drawn when translation exists; lines without translation (self-talk or same language) leave line 2 blank, doesn't affect reading.
+
+**Why ITEM_HEIGHT changed from 12 to 20**: Dual-line text needs two lines of 9px = 18px + 1px padding top/bottom = 20px. 1.21.1's EntryListWidget itemHeight is list-level (no per-entry custom height, that's 1.21.8+), so GroupTitleWidget and SystemEventWidget also become 20px — they center single-line text in 20px, no display impact.
+
+**Export format synced to dual-line**: Interface and export maintain consistent presentation, convenient for player reference. Line 1 `[Time] <Speaker> Original`, line 2 indented `⇄ Translation [sourceLang→targetLang]`. Removed old [Source] label (consistent with interface, using color to distinguish source instead of text label).
+
+**Sort option rename — TIME_DESC from "Newest first" to "Default"**: TIME_DESC is the initial sort mode and what most players will keep using. "Newest first" describes behavior, "Default" describes status — players seeing "Default" know it's the recommended option without needing to understand what "Newest first" means. Other sort options keep descriptive naming ("Oldest first", "Most messages", "Most participants"), forming contrast with "Default".
+
+**Filter panel whitespace optimization — height from 104px to 60px**: Panel only has 3 rows of controls (row 1 source+reset 16px, row 2 participant+sort 16px, row 3 keyword+show-translation 16px), actual usage ~60px, but FILTER_PANEL_HEIGHT was 104px leaving 44px blank below row 3. Tightened to 60px, expanding list area by 44px when panel expanded.
+
+**Untranslated message rows vertically centered — mitigating fixed row height emptiness**: User reported "the selected message box — make it smaller and translation overflows, make it bigger and it's too empty". Root cause: 1.21.1's EntryListWidget itemHeight is list-level uniform (no per-entry custom height until 1.21.8), dual-line translated rows need 20px, single-line untranslated rows are also 20px — single-line text at y+2 leaves a large blank below. Can't vary height per entry, but can vertically center untranslated rows (`y + (entryHeight - fontHeight) / 2`) so it's visually less empty. Translated rows keep y+2 / y+11 dual-line layout. The selection highlight box is a rectangle drawn by AlwaysSelectedEntryListWidget parent class by itemHeight, can't be adjusted individually — this is a hard 1.21.1 limitation, fully solving it requires upgrading to 1.21.8+ per-entry height API.
+
+**System event text scaled to 0.85 — auxiliary info shouldn't match body text size**: User reported "started a new conversation" prompt is too large. It's a separator-style auxiliary message (marking a new conversation group's start), not message content — same size as body text steals focus. Scaling to 0.85 retains readability while clearly placing it below body text in visual hierarchy. Uses `context.getMatrices().scale()` then recalculates centering coordinates (divide by scale to restore to scaled coordinate system), maintaining horizontal and vertical centering.
+
+**Group title scaled from 1.3 to 1.1**: User reported group title is too large. 1.3x font size in 20px row height looks top-heavy (scaled height ~11.7px, over half the row height, too large a visual gap from message rows below). 1.1x still creates hierarchy distinction (title slightly larger than body indicating "this is a group title") without being obtrusive. Combined with the left white sidebar, 1.1x + white text is enough to establish visual hierarchy.
+
+---
+
+## 1.1.6 (cont.)　Double-click jar installation popup
+
+**Why this feature is needed**: Many new players download the jar and double-click trying to "install" or "run" it, only to see JVM errors (like "no main manifest attribute" or "could not find or load main class"), with no idea what to do. A friendly popup saves a lot of "I don't know how to install" questions and reduces player doubt about "is this thing broken".
+
+**Why no dependency on Minecraft/Fabric**: Double-clicking the jar makes JVM call main directly; Fabric Loader hasn't intervened yet, Minecraft classes aren't on the classpath. This class can only use JDK's built-in Swing/AWT. Fabric Loader identifies mods via fabric.mod.json, completely ignores MANIFEST.MF's Main-Class, so adding this entry doesn't affect in-game loading — putting the jar in the mods folder works as normal.
+
+**Why translations are hardcoded in Map instead of reading language files**: `assets/mccf/lang/*.json` is for Minecraft's `Text.translatable()`, requiring Minecraft's resource loading pipeline. Double-clicking the jar has no such pipeline, must manage translations itself. Hardcoding 9 languages + English fallback covers all languages the project supports. If adding new languages in the future, need to update both `assets/mccf/lang/*.json` (in-game) and `JarDoubleClick.TRANSLATIONS` (double-click popup) — the two translation sets are independent with no shared data source.
+
+**Why Desktop.browse instead of Minecraft's Util.getOperatingSystem().open()**: Double-clicking the jar has no Minecraft context, Util class isn't on classpath. Desktop API is JDK's built-in cross-platform solution, works on Windows/macOS/Linux. Silently ignores failure — player can manually copy URL, popup text already has path hints.
+
+**Why system native look and feel instead of Java default**: Players trust "looks like system popup" more than "looks like Java program" — the latter easily mistaken for virus or malware. `UIManager.setLookAndFeel(UIManager.getSystemLookAndFeelClassName())` makes popup use Windows/macOS/Linux native window style.
+
+**Why showOptionDialog instead of showMessageDialog**: Need two buttons ("Open Tutorial" + "OK"), showMessageDialog only has one. showOptionDialog allows custom button text and order; first button ("Open Tutorial") returns 0, second button ("OK") returns 1, close button (X) returns -1 treated as "OK" without opening browser.
+
+---
+
 ## 1.1.5　Permission state machine + Mock warning + export log opens folder
 
 **Permission state machine design**: Server config tab visibility has three levels — HIDDEN (tab completely hidden), READ_ONLY (shown but greyed + yellow banner), EDITABLE (normal). Judgment order:
