@@ -1,12 +1,14 @@
 package net.mccf.mod.client.config;
 
+import java.util.ArrayList;
+import java.util.List;
+
 import net.fabricmc.fabric.api.client.networking.v1.ClientPlayNetworking;
 import net.mccf.mod.client.mode.ClientOnlyModeManager;
 import net.mccf.mod.network.RequestConfigPayload;
 import net.minecraft.client.MinecraftClient;
 import net.minecraft.client.gui.DrawContext;
 import net.minecraft.client.gui.screen.Screen;
-import net.minecraft.client.gui.widget.ButtonWidget;
 import net.minecraft.text.Text;
 import net.minecraft.util.Colors;
 
@@ -73,8 +75,11 @@ public class MCCFConfigScreen extends Screen {
 	/** 当前显示哪个面板。默认服务端配置——多数玩家打开设置是为了改服务器上生效的 Provider。 */
 	private Tab activeTab = Tab.SERVER;
 
-	private ButtonWidget serverTabButton;
-	private ButtonWidget localTabButton;
+	/**
+	 * 顶部标签栏每个标签的命中区域。1.1.6 改为自绘标签栏（还原创建新世界界面的扁平标签视觉），
+	 * 不再用 ButtonWidget——init 里计算位置存这里，render 画标签、mouseClicked 检测点击都读它。
+	 */
+	private final List<TabRect> tabRects = new ArrayList<>();
 
 	/**
 	 * 跨 init() 重建保留的"上次选中 Provider"——分 server/local 两个标签页各自独立保存。
@@ -206,40 +211,13 @@ public class MCCFConfigScreen extends Screen {
 		lastServerVisibility = visibility;
 		boolean serverTabVisible = visibility != ServerPanelVisibility.HIDDEN;
 
-		int tabWidth = 200;
-		int tabGap = 4;
-
-		if (serverTabVisible) {
-			// 两个标签并排
-			int tabBarWidth = tabWidth * 2 + tabGap;
-			int tabBarLeft = contentLeft + (contentRight - contentLeft - tabBarWidth) / 2;
-
-			serverTabButton = ButtonWidget.builder(tabLabel(Tab.SERVER), button -> switchTab(Tab.SERVER))
-					.dimensions(tabBarLeft, MARGIN, tabWidth, TAB_BAR_HEIGHT)
-					.build();
-			addDrawableChild(serverTabButton);
-
-			localTabButton = ButtonWidget.builder(tabLabel(Tab.LOCAL), button -> switchTab(Tab.LOCAL))
-					.dimensions(tabBarLeft + tabWidth + tabGap, MARGIN, tabWidth, TAB_BAR_HEIGHT)
-					.build();
-			addDrawableChild(localTabButton);
-
-			// 服务端标签可见时，如果当前 activeTab 是 SERVER 但服务端标签被隐藏了
-			//（上次打开时是可编辑的，这次变成 HIDDEN），切到 LOCAL 标签
-			if (activeTab == Tab.SERVER && visibility == ServerPanelVisibility.HIDDEN) {
-				activeTab = Tab.LOCAL;
-			}
-		} else {
-			// 只有本地设置标签，居中显示
-			int tabBarLeft = contentLeft + (contentRight - contentLeft - tabWidth) / 2;
-			localTabButton = ButtonWidget.builder(tabLabel(Tab.LOCAL), button -> switchTab(Tab.LOCAL))
-					.dimensions(tabBarLeft, MARGIN, tabWidth, TAB_BAR_HEIGHT)
-					.build();
-			addDrawableChild(localTabButton);
-			serverTabButton = null;
-			// 服务端标签隐藏时强制切到本地设置
+		// 1.1.6：服务端标签隐藏时强制切到本地设置（之前在 ButtonWidget 分支里处理，
+		// 改为自绘标签后统一在这里处理）。
+		if (!serverTabVisible) {
 			activeTab = Tab.LOCAL;
 		}
+		// 计算标签栏布局——自绘标签用，render 画标签 + mouseClicked 检测点击都读 tabRects。
+		buildTabRects(serverTabVisible);
 
 		// 1.1.3 修复：重建前先从旧 Panel 读出 selectedProvider 保留下来。
 		if (serverPanel != null) {
@@ -272,20 +250,21 @@ public class MCCFConfigScreen extends Screen {
 		applyTabVisibility();
 	}
 
+	/**
+	 * 1.1.6：标签文字——不再用 » « 前缀标识选中态（自绘标签用底部高亮线标识选中，
+	 * 比 » « 更接近创建新世界界面的扁平标签风格）。
+	 */
 	private Text tabLabel(Tab tab) {
 		String key = tab == Tab.SERVER ? "mccf.config.tab.server" : "mccf.config.tab.local";
-		Text base = Text.translatable(key);
-		return activeTab == tab ? Text.literal("» ").append(base).append(" «") : base;
+		return Text.translatable(key);
 	}
 
 	private void switchTab(Tab tab) {
 		if (activeTab == tab) return;
-		// 1.1.5：服务端标签隐藏时不允许切到 SERVER
-		if (tab == Tab.SERVER && serverTabButton == null) return;
+		// 1.1.5：服务端标签隐藏时不允许切到 SERVER——tabRects 里没有 SERVER 项就说明隐藏了。
+		if (tab == Tab.SERVER && tabRects.stream().noneMatch(tr -> tr.tab == Tab.SERVER)) return;
 		activeTab = tab;
 		applyTabVisibility();
-		if (serverTabButton != null) serverTabButton.setMessage(tabLabel(Tab.SERVER));
-		if (localTabButton != null) localTabButton.setMessage(tabLabel(Tab.LOCAL));
 	}
 
 	/** 只显示当前标签对应的 Panel 控件，另一个标签的控件整体隐藏（不可见也不可交互）。 */
@@ -301,6 +280,16 @@ public class MCCFConfigScreen extends Screen {
 	public void onSnapshotUpdated() {
 		if (serverPanel != null) {
 			serverPanel.onSnapshotUpdated();
+		}
+	}
+
+	/**
+	 * 1.1.7 新增：供 ServerConfigPanel 的 Mock 确认弹窗回调使用——先 setScreen 触发 init 重建，
+	 * 然后调此方法在新 panel 上执行 performSave。见 ServerConfigPanel.onSave 的注释。
+	 */
+	public void triggerServerPerformSave() {
+		if (serverPanel != null) {
+			serverPanel.triggerPerformSave();
 		}
 	}
 
@@ -332,6 +321,7 @@ public class MCCFConfigScreen extends Screen {
 
 		super.render(context, mouseX, mouseY, delta);
 		context.drawCenteredTextWithShadow(textRenderer, title, this.width / 2, 4, Colors.WHITE);
+		renderTabBar(context, mouseX, mouseY);
 
 		if (activeTab == Tab.SERVER && serverPanel != null) {
 			serverPanel.render(context, mouseX, mouseY, delta);
@@ -340,10 +330,100 @@ public class MCCFConfigScreen extends Screen {
 		}
 	}
 
+	/**
+	 * 1.1.6：自绘顶部标签栏——还原创建新世界界面的扁平标签视觉。
+	 *
+	 * 之前用 ButtonWidget 画标签（带边框的按钮 + » « 文字前缀标识选中），视觉上像
+	 * 普通按钮不像"标签页"。改为自绘：纯文字标签，选中态用底部 2px 白色高亮线标识
+	 *（和创建新世界界面的"游戏/世界/更多"标签一致），非选中态文字灰色、hover 浅灰。
+	 * 底部画一条暗色分隔线把标签栏和下方面板内容隔开。
+	 *
+	 * 不用原生 TabNavigationWidget 的原因：它绑定 TabManager 的控件增删机制，而 MCCF
+	 * 的 Panel 用 setVisible 管控件可见性而非增删，模式不匹配；且 TabNavigationWidget
+	 * 没有暴露 setPosition，y 坐标不可控（默认 0 会和标题重叠）。自绘能精确控制位置和样式。
+	 */
+	private void renderTabBar(DrawContext context, int mouseX, int mouseY) {
+		int tabY = MARGIN;
+		for (TabRect tr : tabRects) {
+			boolean active = tr.tab == activeTab;
+			boolean hovered = tr.contains(mouseX, mouseY);
+			// 选中白色、hover 浅灰、默认灰色——和创建新世界标签的颜色层次一致。
+			int color = active ? Colors.WHITE : (hovered ? Colors.LIGHT_GRAY : Colors.GRAY);
+			Text label = tabLabel(tr.tab);
+			int textX = tr.x + (tr.width - textRenderer.getWidth(label)) / 2;
+			int textY = tabY + (TAB_BAR_HEIGHT - textRenderer.fontHeight) / 2;
+			context.drawTextWithShadow(textRenderer, label, textX, textY, color);
+			// 选中标签底部画 2px 高亮线——这是创建新世界标签的标志性视觉。
+			if (active) {
+				context.fill(tr.x, tabY + TAB_BAR_HEIGHT - 2, tr.x + tr.width, tabY + TAB_BAR_HEIGHT, Colors.WHITE);
+			}
+		}
+		// 标签栏底部分隔线——用半透明深灰，和原版选项界面的分隔线风格一致。
+		context.fill(MARGIN, tabY + TAB_BAR_HEIGHT, this.width - MARGIN, tabY + TAB_BAR_HEIGHT + 1, 0xFF555555);
+	}
+
+	/**
+	 * 1.1.6：计算标签栏布局——每个标签的 x 坐标和宽度，存到 tabRects。
+	 * 标签宽度按文字宽度 + 两侧 padding 计算，整体居中排列，标签间留 8px 间隔。
+	 */
+	private void buildTabRects(boolean serverTabVisible) {
+		tabRects.clear();
+		List<Tab> visible = new ArrayList<>();
+		if (serverTabVisible) visible.add(Tab.SERVER);
+		visible.add(Tab.LOCAL);
+
+		int tabGap = 8;
+		int tabPadding = 20;
+		int[] widths = new int[visible.size()];
+		int totalWidth = 0;
+		for (int i = 0; i < visible.size(); i++) {
+			widths[i] = textRenderer.getWidth(tabLabel(visible.get(i))) + tabPadding * 2;
+			totalWidth += widths[i];
+			if (i > 0) totalWidth += tabGap;
+		}
+		int x = (this.width - totalWidth) / 2;
+		for (int i = 0; i < visible.size(); i++) {
+			tabRects.add(new TabRect(visible.get(i), x, widths[i]));
+			x += widths[i] + tabGap;
+		}
+	}
+
+	@Override
+	public boolean mouseClicked(double mouseX, double mouseY, int button) {
+		// 1.1.6：自绘标签的点击检测——左键点击落在某个 TabRect 内就切换标签。
+		if (button == 0) {
+			for (TabRect tr : tabRects) {
+				if (tr.contains(mouseX, mouseY)) {
+					switchTab(tr.tab);
+					return true;
+				}
+			}
+		}
+		return super.mouseClicked(mouseX, mouseY, button);
+	}
+
 	@Override
 	public void close() {
 		if (client != null) {
 			client.setScreen(parent);
+		}
+	}
+
+	/** 1.1.6：标签栏命中区域——存标签枚举、x 坐标、宽度，供 render 画和 mouseClicked 检测。 */
+	private class TabRect {
+		final Tab tab;
+		final int x;
+		final int width;
+
+		TabRect(Tab tab, int x, int width) {
+			this.tab = tab;
+			this.x = x;
+			this.width = width;
+		}
+
+		boolean contains(double mouseX, double mouseY) {
+			return mouseX >= x && mouseX < x + width
+					&& mouseY >= MARGIN && mouseY < MARGIN + TAB_BAR_HEIGHT;
 		}
 	}
 }

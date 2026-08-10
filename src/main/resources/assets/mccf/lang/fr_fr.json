@@ -67,7 +67,7 @@
   "mccf.history.clear.confirm": "Voulez-vous vraiment effacer tout l'historique du chat ? Cette action est irréversible.",
   "mccf.history.clear.confirm_title": "Effacer l'historique",
   "mccf.history.export": "Exporter",
-  "mccf.history.jump_latest": "↓ Récent",
+  "mccf.history.jump_latest": "↑ Récent",
   "mccf.history.reset": "Réinitialiser",
   "mccf.history.close": "Fermer",
   "mccf.history.conversation_started": "A commencé une nouvelle conversation",

@@ -326,21 +326,31 @@ public class ServerConfigPanel extends ProviderConfigPanel {
 		// 但归零这个字段仍有意义：万一以后新增"重新连接后再次显示加载"之类
 		// 的场景，这个字段的状态要保持干净，不留一个过期的历史时间戳。
 		snapshotRequestedAtMillis = 0;
-		// 1.1.4 修复：删除 `selectedProvider = state.activeProvider` 这一行。
-		// 旧代码在每次收到快照时都把 selectedProvider 重置为 activeProvider，导致：
-		// 玩家选 B 查看 → 点获取模型 → ModelSelectionScreen 关闭触发 init() 重建 →
-		// 新 panel 构造函数发 requestSnapshot() → 服务端回快照 → onSnapshotUpdated()
-		// → selectedProvider 被重置回 activeProvider（A）→ 玩家看到 Provider 切回 A。
+		// 1.1.7 修复：服务端切换 Provider 后选中框不跟随 + 不滚动的问题。
 		//
-		// 为什么删除是安全的：
-		// - 首次打开界面：selectedProvider 通过 initialSelectedProvider() = activeProvider 初始化，不需要这里再设
-		// - init() 重建：selectedProvider 通过 preservedSelectedProvider 保留，不需要这里覆盖
-		// - 保存后：onSave 把 selectedProvider 设为 pendingActiveProvider，保存后 activeProvider = selectedProvider，不需要这里重置
-		// - 别的管理员改了 activeProvider：玩家保留当前查看的 Provider 不被打断——这是更好的行为
+		// 1.1.4 删除了 `selectedProvider = state.activeProvider`（防止 init 重建后
+		// requestSnapshot 回包把玩家正在查看的 Provider 重置回 activeProvider）。
+		// 但这导致另一个问题：别人/命令改了 activeProvider 后，客户端收到广播快照，
+		// 选中框不跟随——DeepSeek 改成 Kimi 后，选中框还在 DeepSeek，只有 Kimi 有 ✓。
 		//
-		// 唯一的行为变化是"管理员改配置后选中不跟随"——但这不打断玩家正在查看的 Provider，是合理的。
+		// 用 state.previousActiveProvider 区分两种场景：
+		// - selectedProvider == previousActiveProvider：玩家没在看别的 Provider（选中框
+		//   就在旧 activeProvider 上），activeProvider 变了应跟随——这是"别人改配置，我也没在看别的"。
+		// - selectedProvider != previousActiveProvider：玩家在看别的 Provider（手动切到 B
+		//   查看），activeProvider 变了不打断玩家查看——这是"我在看 B，别人改了 A，保留 B"。
+		//   （1.1.4 注释里"不打断玩家正在查看的 Provider"指的就是这种情况。）
+		//
+		// previousActiveProvider 由 ClientConfigState.applySnapshot 在更新 activeProvider
+		// 之前记录——此时 onSnapshotUpdated 还没被调用，state.previousActiveProvider 是旧值。
+		if (selectedProvider.equals(state.previousActiveProvider)
+				&& !selectedProvider.equals(state.activeProvider)) {
+			selectedProvider = state.activeProvider;
+		}
 		if (listWidget != null) {
 			listWidget.setSelectedProvider(selectedProvider);
+			// 1.1.7：选中框跟随到新 activeProvider 后，如果该 Provider 不在当前可视区域内
+			// （跨页），自动滚动到该 Provider——否则玩家看不到选中框切过去了。
+			listWidget.scrollToProvider(selectedProvider);
 		}
 		refreshFieldsFromState();
 		applyEditability();
@@ -501,16 +511,35 @@ public class ServerConfigPanel extends ProviderConfigPanel {
 		if (selectedProvider.equals("mock") && !"mock".equals(state.activeProvider)) {
 			MinecraftClient.getInstance().setScreen(new net.minecraft.client.gui.screen.ConfirmScreen(
 					confirmed -> {
-						if (confirmed) {
-							performSave();
-						}
+						// 1.1.7 修复：必须先 setScreen 后 performSave（和 LocalConfigPanel 一致）。
+						// 旧版顺序相反（先 performSave 后 setScreen），setScreen 触发 init 重建，
+						// 新 panel 构造函数调 requestSnapshot() 发 RequestConfigPayload。服务端回的
+						// ConfigSnapshotPayload 触发 applySnapshot，第81行 pendingActiveProvider 被重置
+						// 为 activeProvider——如果 requestSnapshot 回包在 UpdateConfigPayload 的
+						// broadcast 之前到达，state 会被临时重置回旧值，导致第一次点确认"不应用"。
+						// 改为先 setScreen（触发 init 重建 + requestSnapshot），然后通过
+						// triggerServerPerformSave 在新 panel 上执行 performSave——确保 performSave
+						// 在 init 重建之后执行，且读的是新 panel 的字段。
 						MinecraftClient.getInstance().setScreen(screen);
+						if (confirmed && screen instanceof MCCFConfigScreen mccf) {
+							mccf.triggerServerPerformSave();
+						}
 					},
 					Text.translatable("mccf.config.mock_warning_title"),
 					Text.translatable("mccf.config.mock_warning_body")));
 			return;
 		}
 
+		performSave();
+	}
+
+	/**
+	 * 1.1.7 新增：供 MCCFConfigScreen 在 init 重建后调用——Mock 确认弹窗回调需要
+	 * 先 setScreen 触发重建，再在新 panel 上执行 performSave。performSave 读的是
+	 * 新 panel 的 selectedProvider（通过 preservedSelectedProvider 保留了 "mock"），
+	 * Mock 不需要 apiKey/model/endpoint（字段为空不影响），state 是单例。
+	 */
+	void triggerPerformSave() {
 		performSave();
 	}
 

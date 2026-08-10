@@ -67,7 +67,7 @@
   "mccf.history.clear.confirm": "Are you sure you want to clear all chat history? This cannot be undone.",
   "mccf.history.clear.confirm_title": "Clear History",
   "mccf.history.export": "Export",
-  "mccf.history.jump_latest": "↓ Latest",
+  "mccf.history.jump_latest": "↑ Latest",
   "mccf.history.reset": "Reset",
   "mccf.history.close": "Close",
   "mccf.history.conversation_started": "Started a new conversation",

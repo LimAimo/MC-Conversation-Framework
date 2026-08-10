@@ -67,7 +67,7 @@
   "mccf.history.clear.confirm": "確定要清空所有聊天歷史記錄嗎？此操作不可撤銷。",
   "mccf.history.clear.confirm_title": "清空歷史",
   "mccf.history.export": "匯出",
-  "mccf.history.jump_latest": "↓ 最新",
+  "mccf.history.jump_latest": "↑ 最新",
   "mccf.history.reset": "重設",
   "mccf.history.close": "關閉",
   "mccf.history.conversation_started": "開始了一段新對話",

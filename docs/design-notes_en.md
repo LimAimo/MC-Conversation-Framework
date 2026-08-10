@@ -63,6 +63,36 @@
 
 ---
 
+## 1.1.7　Config screen tab bar redesign
+
+**Config screen tab bar redesign — self-drawn flat tabs replace ButtonWidget**: User wanted the top tab bar effect from the Create New World screen ("Game/World/More"). Old version used ButtonWidget for tabs (bordered buttons + » « text prefix to mark selection), visually looking like regular buttons rather than "tabs".
+
+Researched the native `TabNavigationWidget` (the same component used by Create New World screen, 1.21.1 Yarn has `builder(TabManager, int)` + `tabs(Tab[])` + `selectTab` API). But integrating it has two obstacles: (1) it's bound to `TabManager`'s widget add/remove mechanism — `setCurrentTab` adds/removes widgets via `Tab.forEachChild(tabLoadConsumer/tabUnloadConsumer)`, while MCCF's Panel uses `setVisible()` to manage widget visibility rather than add/remove (widgets are all added to Screen at init, tab switching only toggles visibility), a pattern mismatch — forcing integration would require refactoring ProviderConfigPanel's widget management, high risk (would touch the permission state machine, Mock warning banner, etc.); (2) `TabNavigationWidget` doesn't expose `setPosition`, y-coordinate is uncontrollable — default at y=0 would overlap with the title (y=4), and couldn't compile-verify its actual positioning behavior (project has no gradlew, local Gradle version incompatible with Loom).
+
+Switched to self-drawn tab bar: pure text tabs (`drawTextWithShadow`), selected state marked by a 2px white highlight line at the bottom (`context.fill`) — the signature visual of Create New World tabs; unselected text gray (`Colors.GRAY`), hover light gray (`Colors.LIGHT_GRAY`); a 1px dark separator line (`0xFF555555`) at the bottom separates the tab bar from the content area. Tab positions are calculated in `init` and stored in `tabRects` (`List<TabRect>`), read by both `render` (draws tabs) and `mouseClicked` (hit detection). Tab width is text width + 20px padding on each side, centered as a group. Fully controllable position and style, doesn't touch Panel logic, low risk.
+
+**Mock save confirmation needed two clicks — ConfirmScreen callback had performSave/setScreen in wrong order**: User reported selecting Mock → Save → confirmation popup → clicking "Yes" doesn't apply the first time, requires saving and confirming again.
+
+Root cause: ServerConfigPanel's ConfirmScreen callback was `performSave then setScreen`, while LocalConfigPanel was `setScreen then performSave` — the two panels had inconsistent callback ordering. ServerConfigPanel's ordering problem: performSave executes first (sets `state.pendingActiveProvider="mock"`, sends UpdateConfigPayload), then setScreen triggers init rebuild, new ServerConfigPanel constructor calls `requestSnapshot()` sending RequestConfigPayload. The server's ConfigSnapshotPayload response triggers `ClientConfigState.applySnapshot`, [line 81](file:///d:/CodingREPO/MC-Conversation-Framework-1.21.1/src/client/java/net/mccf/mod/client/config/ClientConfigState.java#L81) `this.pendingActiveProvider = this.activeProvider` resets pendingActiveProvider to activeProvider — if requestSnapshot's response (old value) reaches the client before UpdateConfigPayload's broadcast (mock), state gets temporarily reset to the old value, making the UI show "not applied".
+
+Fix: Changed to the same order as LocalConfigPanel — first setScreen (triggers init rebuild + requestSnapshot), then execute performSave on the new panel via `MCCFConfigScreen.triggerServerPerformSave()`. This way performSave executes after init rebuild, reading the new panel's selectedProvider (preserved as "mock" via preservedSelectedProvider). Mock doesn't need apiKey/model/endpoint (empty fields don't matter), state is a singleton. Added `ServerConfigPanel.triggerPerformSave()` (package-private) as a bridge method, MCCFConfigScreen.triggerServerPerformSave() forwards the call.
+
+Why LocalConfigPanel didn't have this problem: LocalConfigPanel's ConfirmScreen is for "force server mode but server doesn't have MCCF" confirmation, which doesn't use network packets (saves to local file), so there's no applySnapshot state-reset race. ServerConfigPanel's Mock confirmation uses network packets (UpdateConfigPayload + requestSnapshot response), creating a timing race.
+
+**Provider list selection box not following after server switches Provider — side effect of 1.1.4's blanket removal of selectedProvider=activeProvider**: User reported that after server changed DeepSeek to Kimi, the client received the broadcast snapshot, but the list selection box stayed on DeepSeek with only Kimi showing the ✓ checkmark; it also didn't auto-scroll to the new Provider when cross-page.
+
+Root cause is the 1.1.4 fix — at the time it removed `selectedProvider = state.activeProvider` from `onSnapshotUpdated` to prevent init rebuild's requestSnapshot response from resetting the Provider the player was viewing back to activeProvider. The 1.1.4 comments acknowledged "the only behavior change is 'selection doesn't follow after admin changes config'", deeming "not interrupting the Provider the player is currently viewing" reasonable. But this created an obvious problem: if the player wasn't viewing another Provider (selection box was on the old activeProvider), after someone else changed the config the selection box didn't follow — the player sees the selection box and ✓ checkmark inconsistent, which is confusing.
+
+Fix: Added a `previousActiveProvider` field to `ClientConfigState`, with `applySnapshot` recording the old value before updating `activeProvider`. `onSnapshotUpdated` uses it to distinguish two scenarios:
+- `selectedProvider == previousActiveProvider`: player isn't viewing another Provider (selection box is on the old activeProvider), should follow to new activeProvider when it changes — this is "someone else changed config, I'm not viewing anything else".
+- `selectedProvider != previousActiveProvider`: player is viewing another Provider (manually switched to B), don't interrupt when activeProvider changes — this is "I'm viewing B, someone changed A, keep B" (what 1.1.4's "don't interrupt" comment referred to).
+
+Without previousActiveProvider, these two scenarios can't be distinguished — both have `selectedProvider != new activeProvider`, but the former should follow while the latter should be preserved.
+
+Also added `listWidget.scrollToProvider(selectedProvider)` — after the selection box follows, if the new activeProvider isn't in the current viewport (cross-page), auto-scroll to that Provider. scrollToProvider internally checks "already fully visible then return", making it a no-op for cases that don't need scrolling, with no side effects from calling it every onSnapshotUpdated.
+
+---
+
 ## 1.1.6 (cont.)　Double-click jar installation popup
 
 **Why this feature is needed**: Many new players download the jar and double-click trying to "install" or "run" it, only to see JVM errors (like "no main manifest attribute" or "could not find or load main class"), with no idea what to do. A friendly popup saves a lot of "I don't know how to install" questions and reduces player doubt about "is this thing broken".

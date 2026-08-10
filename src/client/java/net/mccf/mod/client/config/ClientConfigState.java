@@ -48,6 +48,19 @@ public class ClientConfigState {
 	public boolean canEdit = false;
 	public String activeProvider = "mock";
 	/**
+	 * 1.1.7 新增：applySnapshot 时记录的"上一个 activeProvider"。
+	 * 用于 ServerConfigPanel.onSnapshotUpdated 区分两种快照到达场景：
+	 * (1) init 重建后的 requestSnapshot 回包——activeProvider 没变，
+	 *     selectedProvider 应保留玩家正在查看的（1.1.4 修复的场景）；
+	 * (2) 别人/命令改了 activeProvider 的广播——如果玩家没在看别的
+	 *     Provider（selectedProvider == previousActiveProvider），
+	 *     选中框应跟随到新 activeProvider，并滚动到该 Provider。
+	 * 没有 previousActiveProvider 就无法区分"玩家在看别的"和"玩家在看旧的
+	 * activeProvider"——两者都是 selectedProvider != 新 activeProvider，但前者
+	 * 应保留、后者应跟随。
+	 */
+	public String previousActiveProvider = "mock";
+	/**
 	 * UI 中"待启用"的 Provider：0.10.0 起，玩家点击"保存"时会把当前左侧列表
 	 * 选中查看的 Provider 写入此字段（不再有单独的"设为默认"/"保存并启用"
 	 * 按钮，保存这一个动作同时完成"保存字段改动"和"设为默认"两件事，见
@@ -77,6 +90,9 @@ public class ClientConfigState {
 		if (root == null) return;
 
 		this.canEdit = root.has("canEdit") && root.get("canEdit").getAsBoolean();
+		// 1.1.7：记录旧 activeProvider，供 ServerConfigPanel.onSnapshotUpdated 判断
+		// 是否应该让选中框跟随到新 activeProvider（见 previousActiveProvider 字段注释）。
+		this.previousActiveProvider = this.activeProvider;
 		this.activeProvider = root.has("activeProvider") ? root.get("activeProvider").getAsString() : "mock";
 		this.pendingActiveProvider = this.activeProvider;
 

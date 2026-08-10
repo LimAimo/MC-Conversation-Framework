@@ -67,7 +67,7 @@
   "mccf.history.clear.confirm": "すべてのチャット履歴をクリアしますか？この操作は取り消せません。",
   "mccf.history.clear.confirm_title": "履歴をクリア",
   "mccf.history.export": "エクスポート",
-  "mccf.history.jump_latest": "↓ 最新",
+  "mccf.history.jump_latest": "↑ 最新",
   "mccf.history.reset": "リセット",
   "mccf.history.close": "閉じる",
   "mccf.history.conversation_started": "新しい会話が始まりました",

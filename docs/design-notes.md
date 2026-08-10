@@ -7,6 +7,36 @@
 
 ---
 
+## 1.1.7　配置界面标签页改版
+
+**配置界面标签页改版——自绘扁平标签替代 ButtonWidget**：用户想要创建新世界界面那种顶部标签页效果（"游戏/世界/更多"）。旧版用 ButtonWidget 画标签（带边框按钮 + » « 文字前缀标识选中），视觉上像普通按钮不像"标签页"。
+
+调研了原生 `TabNavigationWidget`（创建新世界界面同款组件，1.21.1 Yarn 有 `builder(TabManager, int)` + `tabs(Tab[])` + `selectTab` API）。但接入它有两个障碍：(1) 它绑定 `TabManager` 的控件增删机制——`setCurrentTab` 时通过 `Tab.forEachChild(tabLoadConsumer/tabUnloadConsumer)` 增删控件，而 MCCF 的 Panel 用 `setVisible()` 管控件可见性而非增删（控件在 init 时全部 add 到 Screen，切换标签只切可见性），模式不匹配，强行接入要重构 ProviderConfigPanel 的控件管理方式，风险高（会动到权限状态机、Mock 警告横幅等逻辑）；(2) `TabNavigationWidget` 没有暴露 `setPosition`，y 坐标不可控——默认在 y=0 会和标题（y=4）重叠，且无法编译验证其实际定位行为（项目无 gradlew，本机 Gradle 版本与 Loom 不兼容）。
+
+改为自绘标签栏：纯文字标签（`drawTextWithShadow`），选中态底部 2px 白色高亮线（`context.fill`）——这是创建新世界标签的标志性视觉；非选中态文字灰色（`Colors.GRAY`）、hover 浅灰（`Colors.LIGHT_GRAY`）；底部画 1px 暗色分隔线（`0xFF555555`）隔开标签栏和内容区。标签位置在 `init` 里计算存到 `tabRects`（`List<TabRect>`），`render` 画标签、`mouseClicked` 检测点击都读它。标签宽度按文字宽度 + 两侧 20px padding 计算，整体居中排列。完全可控位置和样式，不碰 Panel 逻辑，风险低。
+
+**Mock 保存确认弹窗需点两次才生效——ConfirmScreen 回调的 performSave/setScreen 顺序相反**：用户反馈选 Mock → 保存 → 确认弹窗 → 点"是"后第一次不应用，需要再次保存并确认才生效。
+
+根因：ServerConfigPanel 的 ConfirmScreen 回调是 `先 performSave 后 setScreen`，而 LocalConfigPanel 是 `先 setScreen 后 performSave`——两个 panel 的回调顺序不一致。ServerConfigPanel 的顺序问题在于：performSave 先执行（设 `state.pendingActiveProvider="mock"`，发 UpdateConfigPayload），然后 setScreen 触发 init 重建，新 ServerConfigPanel 构造函数调 `requestSnapshot()` 发 RequestConfigPayload。服务端回的 ConfigSnapshotPayload 触发 `ClientConfigState.applySnapshot`，[第81行](file:///d:/CodingREPO/MC-Conversation-Framework-1.21.1/src/client/java/net/mccf/mod/client/config/ClientConfigState.java#L81) `this.pendingActiveProvider = this.activeProvider` 会把 pendingActiveProvider 重置为 activeProvider——如果 requestSnapshot 的回包（旧值）在 UpdateConfigPayload 的 broadcast（mock）之前到达客户端，state 会被临时重置回旧值，界面显示"没应用"。
+
+修复：改为和 LocalConfigPanel 一致的顺序——先 setScreen（触发 init 重建 + requestSnapshot），然后通过 `MCCFConfigScreen.triggerServerPerformSave()` 在新 panel 上执行 performSave。这样 performSave 在 init 重建之后执行，读新 panel 的 selectedProvider（通过 preservedSelectedProvider 保留为 "mock"）。Mock 不需要 apiKey/model/endpoint（字段为空不影响），state 是单例。新增 `ServerConfigPanel.triggerPerformSave()`（package-private）作为桥接方法，MCCFConfigScreen.triggerServerPerformSave() 转发调用。
+
+为什么 LocalConfigPanel 没有这个问题：LocalConfigPanel 的 ConfirmScreen 是"强制服务器模式但服务端没装 MCCF"的确认，不走网络包（本地保存到文件），没有 applySnapshot 重置 state 的竞态。ServerConfigPanel 的 Mock 确认走网络包（UpdateConfigPayload + requestSnapshot 回包），有时序竞态。
+
+**服务端切换 Provider 后客户端选中框不跟随——1.1.4 一刀切删除 selectedProvider=activeProvider 的副作用**：用户反馈服务端把 DeepSeek 改成 Kimi 后，客户端收到广播快照，但列表选中框还停在 DeepSeek，只有 Kimi 有 ✓ 对勾；跨页时也不自动滚动到新 Provider。
+
+根因是 1.1.4 的修复——当时删除了 `onSnapshotUpdated` 里的 `selectedProvider = state.activeProvider`，防止 init 重建后 requestSnapshot 回包把玩家正在查看的 Provider 重置回 activeProvider。1.1.4 注释里承认"唯一的行为变化是'管理员改配置后选中不跟随'"，当时认为"不打断玩家正在查看的 Provider 是合理的"。但实际上这造成了一个明显的问题：如果玩家没在看别的 Provider（选中框就在旧 activeProvider 上），别人改了配置后选中框不跟随，玩家看到的选中框和 ✓ 对勾不一致，很困惑。
+
+修复方案：在 `ClientConfigState` 加 `previousActiveProvider` 字段，`applySnapshot` 在更新 `activeProvider` 之前记录旧值。`onSnapshotUpdated` 里用它区分两种场景：
+- `selectedProvider == previousActiveProvider`：玩家没在看别的 Provider（选中框就在旧 activeProvider 上），activeProvider 变了应跟随到新 activeProvider——这是"别人改配置，我也没在看别的"。
+- `selectedProvider != previousActiveProvider`：玩家在看别的 Provider（手动切到 B 查看），activeProvider 变了不打断——这是"我在看 B，别人改了 A，保留 B"（1.1.4 注释里"不打断"指的就是这种情况）。
+
+没有 previousActiveProvider 就无法区分这两种场景——两者都是 `selectedProvider != 新 activeProvider`，但前者应跟随、后者应保留。
+
+同时加 `listWidget.scrollToProvider(selectedProvider)`——选中框跟随后，如果新 activeProvider 不在当前可视区域内（跨页），自动滚动到该 Provider。scrollToProvider 内部判断"已完整可见就 return"，对不需要滚动的情况是 no-op，每次 onSnapshotUpdated 调用无副作用。
+
+---
+
 ## 1.1.6　双击 jar 弹窗 + 聊天历史记录大优化
 
 **历史记录持久化的设计变更**：1.1.6 之前 ChatHistoryManager 是纯内存环形缓冲，断开连接即清空。类注释里解释"不落盘是为了避免隐私/多世界归属问题"。用户明确要求"重进游戏不丢失"后，改为持久化到 `config/mccf/chat-history.json`。

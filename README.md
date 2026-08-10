@@ -369,6 +369,16 @@ src/client/java/net/mccf/mod/client/
 
 > 决策分析（根因、方案论证、取舍）已移至 [docs/design-notes.md](docs/design-notes.md)（[英文版](docs/design-notes_en.md)），本章节只保留纯版本更新。
 
+### 2026-08-08　1.1.7 优化：配置界面标签页改版 + Mock 保存确认修复 + Provider 列表选中框跟随
+
+- **配置界面标签页改版**：标签页从带边框的 ButtonWidget + » « 前缀改为自绘的扁平标签（还原创建新世界界面的"游戏/世界/更多"风格）——纯文字标签，选中态底部 2px 白色高亮线标识，非选中灰色、hover 浅灰，底部暗色分隔线隔开标签栏和内容区。
+- **修复 Mock 保存确认弹窗需点两次才生效**：选 Mock → 保存 → 确认弹窗 → 点"是"后第一次不应用，需要再次保存并确认才生效。根因是 ConfirmScreen 回调里 performSave 在 setScreen 之前执行，setScreen 触发 init 重建发 requestSnapshot，回包的 applySnapshot 重置了 pendingActiveProvider。改为先 setScreen 后 performSave（和 LocalConfigPanel 一致），通过 triggerServerPerformSave 在新 panel 上执行保存。
+- **修复服务端切换 Provider 后客户端选中框不跟随**：服务端把 DeepSeek 改成 Kimi 后，客户端收到广播快照，但选中框还停在 DeepSeek，只有 Kimi 有 ✓ 对勾；跨页时也不自动滚动到新 Provider。根因是 1.1.4 删除了 `selectedProvider = state.activeProvider`（防止 init 重建后 requestSnapshot 回包重置玩家查看的 Provider），但一刀切导致别人改配置后选中框也不跟随。用 previousActiveProvider 字段区分：玩家没在看别的 Provider（selectedProvider == 旧 activeProvider）时跟随到新 activeProvider 并滚动；玩家在看别的 Provider 时保留不打断。
+- **跳转最新按钮箭头改向**：聊天历史界面右下角"最新"按钮的箭头从 ↓ 改为 ↑，和默认排序（TIME_DESC 最新在最上面，点按钮滚到顶部）的方向一致。
+- 涉及文件：`MCCFConfigScreen.java`、`ServerConfigPanel.java`、`ClientConfigState.java`、9 个语言文件。
+
+版本号 `1.1.6` → `1.1.7`。决策分析见 [docs/design-notes.md](docs/design-notes.md)。
+
 ### 2026-08-05　1.1.6 新增：双击 jar 弹窗 + 聊天历史记录大优化
 
 - **双击 jar 弹窗**：玩家下载 jar 后双击不再看到 JVM 报错，而是弹一个友好的安装提示窗口，告诉玩家这是 Minecraft 模组、需要放到 mods 文件夹、需要先装 Fabric Loader 和 Fabric API。支持 9 种语言（跟随系统语言），含"打开教程"按钮一键打开 GitHub README。

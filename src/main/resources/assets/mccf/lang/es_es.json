@@ -67,7 +67,7 @@
   "mccf.history.clear.confirm": "¿Está seguro de que desea borrar todo el historial del chat? Esta acción no se puede deshacer.",
   "mccf.history.clear.confirm_title": "Borrar historial",
   "mccf.history.export": "Exportar",
-  "mccf.history.jump_latest": "↓ Reciente",
+  "mccf.history.jump_latest": "↑ Reciente",
   "mccf.history.reset": "Restablecer",
   "mccf.history.close": "Cerrar",
   "mccf.history.conversation_started": "Se inició una nueva conversación",

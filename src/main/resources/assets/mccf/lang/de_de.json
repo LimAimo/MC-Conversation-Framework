@@ -67,7 +67,7 @@
   "mccf.history.clear.confirm": "Möchten Sie wirklich den gesamten Chatverlauf löschen? Diese Aktion kann nicht rückgängig gemacht werden.",
   "mccf.history.clear.confirm_title": "Verlauf löschen",
   "mccf.history.export": "Exportieren",
-  "mccf.history.jump_latest": "↓ Neueste",
+  "mccf.history.jump_latest": "↑ Neueste",
   "mccf.history.reset": "Zurücksetzen",
   "mccf.history.close": "Schließen",
   "mccf.history.conversation_started": "Ein neues Gespräch hat begonnen",

@@ -67,7 +67,7 @@
   "mccf.history.clear.confirm": "모든 채팅 기록을 비우시겠습니까? 이 작업은 되돌릴 수 없습니다.",
   "mccf.history.clear.confirm_title": "기록 비우기",
   "mccf.history.export": "내보내기",
-  "mccf.history.jump_latest": "↓ 최신",
+  "mccf.history.jump_latest": "↑ 최신",
   "mccf.history.reset": "재설정",
   "mccf.history.close": "닫기",
   "mccf.history.conversation_started": "새로운 대화가 시작되었습니다",

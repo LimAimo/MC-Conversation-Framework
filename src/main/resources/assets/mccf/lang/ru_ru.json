@@ -67,7 +67,7 @@
   "mccf.history.clear.confirm": "Вы уверены, что хотите очистить всю историю чата? Это действие нельзя отменить.",
   "mccf.history.clear.confirm_title": "Очистить историю",
   "mccf.history.export": "Экспорт",
-  "mccf.history.jump_latest": "↓ Последние",
+  "mccf.history.jump_latest": "↑ Последние",
   "mccf.history.reset": "Сбросить",
   "mccf.history.close": "Закрыть",
   "mccf.history.conversation_started": "Начался новый разговор",
