@@ -114,20 +114,28 @@ public class MCCFClient implements ClientModInitializer {
 						recordConversationHistory(payload,
 								net.mccf.mod.client.history.ChatHistoryEntry.Source.SELF);
 					} else if (ClientOnlyModeManager.isClientOnlyModeActive()) {
-						// 退回方案：旧服务端不认识 ModePreferencePayload，依旧会拦截原版聊天改发
-						// SubtitlePayload。客户端收不到 CHAT 事件，ClientOnlyChatTranslator 的 CHAT
-						// 监听器不会触发，只能从 SubtitlePayload 里拿文本走本地翻译。
-						// 优先用 originalText（原文）让本地 Provider 按玩家自己语言翻译；
-						// 1.1.1 起服务端始终携带原文，但兼容旧服务端时仍需退到 translatedText。
-						// 1.1.2 起把 payload.speakerName() 也传过去，让历史记录能正确显示说话者名
-						// 而不是解析失败留空显示 "?"——SubtitlePayload 的原文不带 "<玩家名>" 前缀，
-						// 旧版 translateAndAppend 内部的 parseSpeakerName 解析不到，必须显式传入。
-						String sourceText = payload.originalText();
-						if (sourceText == null || sourceText.isBlank()) sourceText = payload.translatedText();
-						if (sourceText != null && !sourceText.isBlank()) {
-							ClientOnlyChatTranslator.translateAndAppend(
-									sourceText, payload.speakerId().toString(), payload.speakerName());
-						}
+					// 退回方案：旧服务端不认识 ModePreferencePayload，依旧会拦截原版聊天改发
+					// SubtitlePayload。客户端收不到 CHAT 事件，ClientOnlyChatTranslator 的 CHAT
+					// 监听器不会触发，只能从 SubtitlePayload 里拿文本走本地翻译。
+					// 优先用 originalText（原文）让本地 Provider 按玩家自己语言翻译；
+					// 1.1.1 起服务端始终携带原文，但兼容旧服务端时仍需退到 translatedText。
+					// 1.1.2 起把 payload.speakerName() 也传过去，让历史记录能正确显示说话者名
+					// 而不是解析失败留空显示 "?"——SubtitlePayload 的原文不带 "<玩家名>" 前缀，
+					// 旧版 translateAndAppend 内部的 parseSpeakerName 解析不到，必须显式传入。
+					//
+					// 1.1.8 修复：说话者非 client-only 时（包括 1.1.8 新增的"服务端给 client-only
+					// 听众发 SubtitlePayload"路径，以及旧服务端退回方案），原版广播被服务端拦截，
+					// client-only 听众收不到原版 CHAT 事件，ChatHud 里不会有原文。必须在这里
+					// 手动 addVisibleToChatHud 显示原文，否则玩家只看到翻译追加行看不到原文。
+					// 说话者也是 client-only 时 onChatMessage return true 放行原版广播，不会走到
+					// 这里（dispatchTo 不被调用），所以不会出现"原版 CHAT + 这里手动"重复显示。
+					String sourceText = payload.originalText();
+					if (sourceText == null || sourceText.isBlank()) sourceText = payload.translatedText();
+					if (sourceText != null && !sourceText.isBlank()) {
+						addVisibleToChatHud(payload.speakerName(), sourceText);
+						ClientOnlyChatTranslator.translateAndAppend(
+								sourceText, payload.speakerId().toString(), payload.speakerName());
+					}
 					} else if ("VISIBLE".equals(payload.displayMode())) {
 						// VISIBLE（看得到说话者）走原版聊天框。这是 0.16.0 起的正式行为——
 						// 早期版本（0.3.0~0.4.0）曾尝试用世界空间渲染器（WorldSubtitleRenderer）

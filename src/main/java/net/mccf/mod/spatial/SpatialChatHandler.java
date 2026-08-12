@@ -12,6 +12,7 @@ import net.minecraft.network.message.MessageType;
 import net.minecraft.network.message.SignedMessage;
 import net.minecraft.server.MinecraftServer;
 import net.minecraft.server.network.ServerPlayerEntity;
+import net.minecraft.text.Text;
 
 import java.util.ArrayList;
 import java.util.List;
@@ -179,6 +180,9 @@ public class SpatialChatHandler {
 			ServerPlayerEntity participant = server.getPlayerManager().getPlayer(participantId);
 			if (participant == null) continue;
 			if (ClientOnlyModeRegistry.isClientOnly(participantId)) continue;
+			// 1.1.8：没装 MCCF 的参与者不支持 ConversationRosterPayload 通道，跳过避免发包失败。
+			if (participant.networkHandler == null) continue;
+			if (!ServerPlayNetworking.canSend(participant.networkHandler, ConversationRosterPayload.ID)) continue;
 			server.execute(() -> {
 				if (participant.networkHandler != null) {
 					ServerPlayNetworking.send(participant, roster);
@@ -207,6 +211,16 @@ public class SpatialChatHandler {
 	private void dispatchSelfEcho(ServerPlayerEntity sender, String speakerName, String rawText,
 			HearingResolver.HearingResult hearing, UUID conversationId) {
 		if (sender.networkHandler == null) return;
+
+		// 1.1.8 修复：说话者没装 MCCF（不支持 SubtitlePayload 通道）时，服务端拦截了
+		// 原版广播后必须用原版方式补发回显——否则说话者自己完全看不到自己发的消息。
+		// sendMessage 发的是系统消息（非签名聊天），手动补 "<名字> 原文" 前缀保持
+		// 与原版聊天栏格式一致。没装 MCCF 的玩家不需要翻译，能看到原文即可。
+		if (!ServerPlayNetworking.canSend(sender.networkHandler, SubtitlePayload.ID)) {
+			sender.sendMessage(Text.literal("<" + speakerName + "> " + rawText), false);
+			return;
+		}
+
 		String displayMode = hearing.visible().size() >= hearing.audibleOnly().size() ? "VISIBLE" : "AUDIBLE";
 		// 自己回显不翻译，sourceLang == targetLang（都是说话者自己的语言）——
 		// 历史记录界面据此判断"这条消息不需要显示语言标签"（源语言=目标语言时，
@@ -224,12 +238,36 @@ public class SpatialChatHandler {
 	private void dispatchTo(List<ServerPlayerEntity> listeners, ServerPlayerEntity sender, String speakerName,
 			String rawText, String sourceLang, List<String> contextMessages, String displayMode, UUID conversationId) {
 		for (ServerPlayerEntity listener : listeners) {
-			// 对 client-only 听众不发字幕：避免给已经选择本地翻译的玩家发服务端字幕，
-			// 造成"原版聊天 + 服务端字幕 + 本地翻译追加"三重叠加显示。这些听众会从原版
-			// CHAT 广播里拿到文本走自己的本地翻译流程（前提是说话者也是 client-only 才有原版广播；
-			// 若说话者非 client-only，这里跳过则该听众什么都收不到——但 client-only 听众明确表态
-			// 不要服务端字幕，这是其主动选择的可见性损失，不是 bug）。
+			// 1.1.8 修复：没装 MCCF 的听众（不支持 SubtitlePayload 通道）用原版 sendMessage
+			// 发原文。服务端拦截了原版广播，不补这一条这些听众就完全收不到消息。
+			// 没装 MCCF 的玩家不需要翻译，能看到原文即可。
+			if (!ServerPlayNetworking.canSend(listener.networkHandler, SubtitlePayload.ID)) {
+				listener.sendMessage(Text.literal("<" + speakerName + "> " + rawText), false);
+				continue;
+			}
+
+			// 1.1.8 修复：client-only 听众在说话者非 client-only 时（走到这里说明说话者
+			// 非 client-only，因为 client-only 说话者在 onChatMessage 开头就 return true 了），
+			// 原版广播已被拦截，收不到原版 CHAT 事件。旧版直接 continue 跳过，导致
+			// client-only 听众完全收不到消息——注释说"主动选择的可见性损失"，但用户体验
+			// 极差，host 选强制客户端模式后什么都看不到。改为发未翻译的 SubtitlePayload
+			//（originalText=translatedText=rawText），客户端走 SubtitlePayload 接收器的
+			// client-only 分支手动显示原文 + 本地翻译。不调 translationService.translate
+			// 避免浪费服务端翻译计算——client-only 玩家明确要用自己的本地 Provider 翻译，
+			// 服务端翻译结果会被客户端忽略。
+			//
+			// 不会导致"原版 CHAT + SubtitlePayload 原文"重复显示：说话者非 client-only 时
+			// 原版广播被拦截，client-only 听众收不到 CHAT；说话者也是 client-only 时
+			// onChatMessage return true 放行原版广播，但根本不会走到 dispatchTo。
 			if (ClientOnlyModeRegistry.isClientOnly(listener.getUuid())) {
+				SubtitlePayload payload = new SubtitlePayload(
+						sender.getUuid(), speakerName, rawText, rawText, displayMode,
+						conversationId, sourceLang, sourceLang);
+				sender.getServer().execute(() -> {
+					if (listener.networkHandler != null) {
+						ServerPlayNetworking.send(listener, payload);
+					}
+				});
 				continue;
 			}
 

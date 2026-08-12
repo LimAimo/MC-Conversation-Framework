@@ -7,6 +7,26 @@
 
 ---
 
+## 1.1.8　服务端装 MCCF 但客户端没装时消息丢失 + 强制客户端模式下收不到消息
+
+**问题一根因——服务端装 MCCF、客户端没装时玩家完全收不到消息**：`SpatialChatHandler.onChatMessage` 对非 client-only 说话者返回 false 拦截原版广播，之后用 `SubtitlePayload`（MCCF 自定义网络通道）做点对点分发。但没装 MCCF 的客户端不认 SubtitlePayload 通道——既收不到原版 CHAT（被拦截），也收不到 SubtitlePayload（不认通道），完全收不到任何消息。说话者自己也是同理：`dispatchSelfEcho` 用 SubtitlePayload 发回显，没装 MCCF 的说话者看不到自己发的消息。代码注释里承认"设计假设所有客户端都装了 MCCF"，但没有兜底。
+
+**问题一修复——用 ServerPlayNetworking.canSend 检测通道支持 + sendMessage 兜底**：在 `dispatchSelfEcho` 和 `dispatchTo` 里用 `ServerPlayNetworking.canSend(player.networkHandler, SubtitlePayload.ID)` 检测玩家是否支持 MCCF 通道。不支持的玩家改用 `player.sendMessage(Text.literal("<" + speakerName + "> " + rawText), false)` 发原版格式文本——sendMessage 发的是系统消息（非签名聊天），手动补 `<名字>` 前缀保持与原版聊天栏格式一致。没装 MCCF 的玩家不需要翻译（他们没有翻译 Provider），能看到原文即可。这是"降级兼容"——有 MCCF 的走完整空间化翻译，没 MCCF 的退化为原版聊天。
+
+**为什么不用 ChatMessageS2CPacket 发签名聊天包**：构造 `ChatMessageS2CPacket` 需要 `SignedMessage` 和 `MessageType.Parameters`，这两个对象在 `dispatchTo` 的签名里没有（只有 rawText 和 speakerName）。要传下去得改 dispatchTo 的方法签名加两个参数，改动面大且 SignedMessage 的签名验证链路复杂（签名密钥、消息链 link 等），手动构造的包可能通不过客户端验证。`sendMessage(Text, false)` 虽然发的是系统消息而非签名聊天，但对兜底场景（没装 MCCF 的玩家只是想看到消息内容）足够了——格式略有差异（没有签名颜色标记）但不影响可读性。
+
+**问题二根因——强制客户端模式下 host 看不到非 client-only 玩家的消息**：host 选强制客户端模式后，`ClientOnlyModeManager.isClientOnlyModeActive()` 返回 true，通过 `ModePreferencePayload` 上报服务端，服务端 `ClientOnlyModeRegistry.setClientOnly(hostUuid, true)` 标记 host 为 client-only。当其他非 client-only 玩家发消息时，服务端 `onChatMessage` 第 67-69 行不触发（说话者非 client-only），正常拦截原版广播（return false）。`dispatchTo` 里对 client-only 听众（host）`continue` 跳过——旧注释说"若说话者非 client-only，这里跳过则该听众什么都收不到——但 client-only 听众明确表态不要服务端字幕，这是其主动选择的可见性损失，不是 bug"。但从用户体验看，host 选强制客户端模式是想要"本地翻译"，不是想要"什么都收不到"——这确实是 bug 不是 feature。
+
+**问题二修复——对 client-only 听众发未翻译 SubtitlePayload**：在 `dispatchTo` 里，对 client-only 听众不再 `continue` 跳过，改为发未翻译的 SubtitlePayload（`originalText=translatedText=rawText`，`sourceLang=targetLang`）。客户端收到后走 SubtitlePayload 接收器的 client-only 分支，用 `originalText` 走 `ClientOnlyChatTranslator.translateAndAppend` 做本地翻译。不调 `translationService.translate` 避免浪费服务端翻译计算——client-only 玩家明确表态要用自己的本地 Provider 翻译，服务端翻译结果会被客户端忽略。
+
+**为什么不担心"原版 CHAT + SubtitlePayload 原文"重复显示**：说话者非 client-only 时原版广播被拦截（return false），client-only 听众收不到 CHAT 事件，SubtitlePayload 是唯一消息来源。说话者也是 client-only 时 `onChatMessage` 第 67-69 行 `return true` 放行原版广播，但根本不会走到 `dispatchTo`（在 return true 前就退出了）——所以 client-only 听众只从原版 CHAT 拿消息，不会收到 SubtitlePayload。两条路径互斥，不会重复。
+
+**问题三修复——SubtitlePayload 接收器 client-only 分支补 addVisibleToChatHud**：旧版 client-only 分支只调 `translateAndAppend`（追加译文），不显示原文——这在退回方案场景（旧服务端不认 ModePreferencePayload）就已经有原文缺失问题，1.1.8 新增的"服务端给 client-only 听众发 SubtitlePayload"路径同理。原版广播被拦截后 client-only 听众的 ChatHud 里没有原文，只有翻译追加行，体验不完整。修复：在 `translateAndAppend` 之前加 `addVisibleToChatHud(payload.speakerName(), sourceText)` 手动显示原文。不会导致重复——如上所述，走到这个分支说明原版广播已被拦截，CHAT 事件不会触发。
+
+**ConversationRosterPayload 也加 canSend 检查**：`broadcastConversationRoster` 原来只跳过 client-only 参与者和 null 参与者，没检查通道支持。没装 MCCF 的参与者不支持 ConversationRosterPayload 通道，虽然 Fabric API 的 `ServerPlayNetworking.send` 对不支持的通道会静默跳过（不抛异常），但显式 canSend 检查更清晰、避免无意义的网络操作。
+
+---
+
 ## 1.1.7　配置界面标签页改版
 
 **配置界面标签页改版——自绘扁平标签替代 ButtonWidget**：用户想要创建新世界界面那种顶部标签页效果（"游戏/世界/更多"）。旧版用 ButtonWidget 画标签（带边框按钮 + » « 文字前缀标识选中），视觉上像普通按钮不像"标签页"。

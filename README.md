@@ -369,6 +369,16 @@ src/client/java/net/mccf/mod/client/
 
 > 决策分析（根因、方案论证、取舍）已移至 [docs/design-notes.md](docs/design-notes.md)（[英文版](docs/design-notes_en.md)），本章节只保留纯版本更新。
 
+### 2026-08-08　1.1.8 修复：服务端装 MCCF 但客户端没装时消息丢失 + 强制客户端模式下收不到消息
+
+- **修复服务端装 MCCF、客户端没装时玩家完全收不到消息**：服务端拦截原版广播后用 SubtitlePayload 分发，但没装 MCCF 的客户端不认这个通道，导致说话者自己看不到自己发的消息、听众也收不到消息。修复：服务端用 `ServerPlayNetworking.canSend` 检测玩家是否支持 SubtitlePayload 通道，不支持的玩家改用原版 `sendMessage` 发 `<名字> 原文` 格式文本（无翻译，但至少能看到消息内容）。
+- **修复强制客户端模式下 host 看不到非 client-only 玩家的消息**：host 选强制客户端模式后被标记为 client-only，其他非 client-only 玩家发消息时服务端拦截原版广播，`dispatchTo` 对 client-only 听众 `continue` 跳过，导致 host 既收不到 CHAT 也收不到 SubtitlePayload。修复：说话者非 client-only 时，对 client-only 听众发未翻译的 SubtitlePayload（不调翻译服务，避免浪费），客户端走 SubtitlePayload 接收器的 client-only 分支手动显示原文 + 本地翻译。
+- **修复 client-only 听众收到 SubtitlePayload 时只显示译文不显示原文**：原版广播被服务端拦截后 client-only 听众收不到 CHAT 事件，SubtitlePayload 接收器的 client-only 分支只调 `translateAndAppend` 追加翻译，原文缺失。修复：在该分支加 `addVisibleToChatHud` 手动显示原文。
+- **ConversationRosterPayload 发送加 canSend 检查**：没装 MCCF 的参与者不支持该通道，跳过避免发包失败。
+- 涉及文件：`SpatialChatHandler.java`、`MCCFClient.java`。
+
+版本号 `1.1.7` → `1.1.8`。决策分析见 [docs/design-notes.md](docs/design-notes.md)。
+
 ### 2026-08-08　1.1.7 优化：配置界面标签页改版 + Mock 保存确认修复 + Provider 列表选中框跟随
 
 - **配置界面标签页改版**：标签页从带边框的 ButtonWidget + » « 前缀改为自绘的扁平标签（还原创建新世界界面的"游戏/世界/更多"风格）——纯文字标签，选中态底部 2px 白色高亮线标识，非选中灰色、hover 浅灰，底部暗色分隔线隔开标签栏和内容区。
