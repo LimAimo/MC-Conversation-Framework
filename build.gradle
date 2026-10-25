@@ -94,6 +94,11 @@ test {
 	useJUnitPlatform()
 }
 
+// Loom 的分环境依赖不会自动进入普通 test；共享完整类路径才能测试使用 Gson/协议类型的逻辑。
+// 测试仍不启动 Minecraft 客户端，纯逻辑 helper 也不访问游戏运行态。
+sourceSets.test.compileClasspath += sourceSets.main.compileClasspath + sourceSets.client.compileClasspath + sourceSets.client.output
+sourceSets.test.runtimeClasspath += sourceSets.main.runtimeClasspath + sourceSets.client.runtimeClasspath
+
 // configure the maven publication
 publishing {
 	publications {

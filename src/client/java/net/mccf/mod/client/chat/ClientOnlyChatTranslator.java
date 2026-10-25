@@ -13,50 +13,26 @@ import net.minecraft.util.Formatting;
 
 import java.util.List;
 import java.util.UUID;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.TimeUnit;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
 /**
- * 纯客户端模式下的聊天翻译：不做任何空间化听觉判定（没有服务端参与，做不到
- * 真正的点对点分发/信息隔离），单纯把收到的每一条玩家聊天消息在本地翻译成
- * 玩家自己的语言，追加显示在聊天栏里——原始消息仍然正常显示，翻译是"追加"
- * 而不是"替换"。
- *
- * 只在 {@link ClientOnlyModeManager#isClientOnlyModeActive()} 为 true 时生效；
- * 服务器装了 MCCF 且未被手动强制切换到纯客户端模式时，翻译由服务端的
- * 空间化管线负责，这里不重复处理，避免同一条消息被翻译两次。
- *
- * 用的是 {@code ClientReceiveMessageEvents.CHAT}（信息性事件，在消息已经
- * 确定会被显示之后触发，不需要返回值），而不是 {@code ALLOW_CHAT}——
- * 因为翻译是异步的（多数 Provider 走网络请求），没法在一次同步事件回调里
- * 立刻拿到结果去替换原始文本，所以选择"让原文正常显示，翻译结果异步追加
- * 一条"的方案，而不是等翻译完成才决定是否放行原始消息。
- *
- * <p>两个调用点都会触发 {@link #translateAndAppend}：
- * 1. {@link #register()} 注册的 CHAT 事件监听器——服务器走原版全服广播时
- *    （说话者也是 client-only，或服务器根本没装 MCCF），客户端正常收到 CHAT 事件。
- * 2. MCCFClient 的 SubtitlePayload 接收器——退回方案：旧服务端不认识
- *    ModePreferencePayload，依旧拦截原版聊天改发 SubtitlePayload，客户端
- *    收不到 CHAT 事件，只能从 SubtitlePayload 里提取文本走这个方法。
+ * 只管本地翻译、请求排序和聊天栏追加，空间判定由安装了 MCCF 的服务器负责。
+ * 无 MCCF 的服务器通过原版 CHAT 事件提供消息；MCCF 服务器通过原文字幕包提供
+ * 已经过空间筛选的消息。本类只在本地翻译模式启用时工作，原文仍由调用方展示。
  */
 public final class ClientOnlyChatTranslator {
+	private static final OrderedClientResults RESULTS = new OrderedClientResults();
 
 	private ClientOnlyChatTranslator() {}
 
-	/**
-	 * 从聊天文本中匹配 "<玩家名> 消息内容" 前缀的正则。
-	 *
-	 * 1.1.2 修复"纯客户端模式下历史记录 speakerName 永远为空"的 bug：
-	 * ClientReceiveMessageEvents.CHAT 的 sender 参数虽然带 UUID，
-	 * 但拿不到稳定的显示名（只有 UUID，没有名字），历史界面因此显示 "?"。
-	 * 退回方案是用聊天文本本身的前缀解析——原版聊天格式是 "<Player> text"，
-	 * 用正则把 Player 部分抠出来作为 speakerName。
-	 *
-	 * 正则限制：只匹配非贪婪的尖括号内容，且要求括号内至少 1 字符、最多 16 字符
-	 * （Minecraft 玩家名长度上限）。这不覆盖所有 Mod 修改过的聊天格式，但
-	 * 原版聊天和绝大多数 Mod 都遵循 "<Name> " 前缀约定。匹配不到时返回 null，
-	 * 调用方继续走"speakerName 留空"的旧路径。
-	 */
+    /**
+     * 仅在消息来源没有 GameProfile 或字幕包姓名时，从原版 <Name> 前缀兜底。
+     * 模组自定义聊天格式不保证可解析，正常 CHAT 路径优先使用 GameProfile 的权威姓名。
+     */
+
 	private static final Pattern SPEAKER_NAME_PATTERN = Pattern.compile("^<([^<>]{1,16})>\\s");
 
 	public static void register() {
@@ -69,17 +45,17 @@ public final class ClientOnlyChatTranslator {
 			String sourceText = message.getString();
 			if (sourceText.isBlank()) return;
 
-			// sender.getId() 返回的是 MessageSender 的 UUID（与 player.getUuid() 同源可比），
+			// sender.getId() 返回的是 GameProfile 的 UUID（与 player.getUuid() 同源可比），
 			// 不是实体 int id。toString 后传给 translateAndAppend 做"是不是自己发的"判定。
 			String senderUuid = (sender != null && sender.getId() != null) ? sender.getId().toString() : null;
-			translateAndAppend(sourceText, senderUuid);
+			translateAndAppend(sourceText, senderUuid, sender != null ? sender.getName() : null);
 		});
 	}
 
 	/**
 	 * 把一条原文走本地翻译后追加显示到聊天栏。供两个调用点复用：
 	 * 1. {@link #register()} 注册的 CHAT 事件监听器（原版聊天广播触发）；
-	 * 2. MCCFClient 的 SubtitlePayload 接收器（旧服务端退回方案触发）。
+	 * 2. MCCFClient 的 SubtitlePayload 接收器（MCCF 服务端发送原文时触发）。
 	 *
 	 * 抽取成独立方法是为了避免两处复制粘贴翻译/节流/Provider 缓存逻辑——
 	 * 这两处的"翻译 + 追加"行为完全一致，只有"文本从哪里来"不同。
@@ -135,33 +111,46 @@ public final class ClientOnlyChatTranslator {
 		// 从不带 "<>" 前缀的纯文本里解析不到名字而留空。
 		String speakerName = speakerNameHint != null ? speakerNameHint : parseSpeakerName(sourceText);
 
-		provider.translate(new TranslationProvider.TranslationRequest(
-				sourceText, "auto", targetLang, List.of()
-		)).thenAccept(result -> client.execute(() -> {
-			if (client.player == null) return;
-			String translated = result.translatedText();
-			if (translated == null || translated.isBlank() || translated.equals(sourceText)) return;
-			client.inGameHud.getChatHud().addMessage(
-					Text.literal("⇄ " + translated).formatted(Formatting.GRAY));
-			net.mccf.mod.client.history.ChatHistoryManager.record(
-					new net.mccf.mod.client.history.ChatHistoryEntry(
-							parseSenderUuid(senderUuid),
-							speakerName != null ? speakerName : "",
-							sourceText, translated,
-							net.mccf.mod.client.history.ChatHistoryEntry.Source.CLIENT_ONLY,
-							System.currentTimeMillis(), null, null, null));
-		})).exceptionally(ex -> {
-			// 1.1.2 修复"翻译失败时玩家完全无感知"：
-			// 旧版只记日志，玩家看到聊天栏里的原文不会意识到"翻译失败"——会以为是
-			// "对方就说了这句话"或"对方也懂我的语言"。新版增加去重提示：60 秒内同一
-			// 错误消息只给玩家发一次聊天栏提示，避免刷屏但仍保证玩家至少感知到一次失败。
-			// 不为每条失败都提示的原因：聊天刷屏时可能秒级失败数十次，全提示会反过来
-			// 把玩家的聊天栏刷爆，体验比"静默失败"更差。
-			String reason = ex.getCause() != null ? ex.getCause().getMessage() : ex.getMessage();
-			MCCF.LOGGER.warn("[MCCF] Client-only translation failed: {}", reason);
-			notifyPlayerOfFailure(client, reason);
-			return null;
-		});
+		var connection = client.getNetworkHandler();
+		long receivedAt = System.currentTimeMillis();
+		var ticket = RESULTS.reserve();
+		CompletableFuture<TranslationProvider.TranslationResult> translation;
+		try {
+			translation = provider.translate(new TranslationProvider.TranslationRequest(
+					sourceText, "auto", targetLang, List.of()));
+		} catch (Exception ex) {
+			translation = CompletableFuture.failedFuture(ex);
+		}
+		// A failed/timed-out request advances the queue so it cannot hold all later messages forever.
+		translation.orTimeout(35, TimeUnit.SECONDS).whenComplete((result, failure) -> client.execute(() ->
+				RESULTS.complete(ticket, () -> {
+					if (client.player == null || client.getNetworkHandler() != connection
+							|| !ClientOnlyModeManager.isClientOnlyModeActive()) return;
+					if (failure != null) {
+						Throwable cause = failure.getCause() != null ? failure.getCause() : failure;
+						String reason = cause.getMessage() != null ? cause.getMessage() : cause.getClass().getSimpleName();
+						MCCF.LOGGER.warn("[MCCF] Client-only translation failed: {}", reason);
+						notifyPlayerOfFailure(client, reason);
+						return;
+					}
+					String translated = result.translatedText();
+					if (translated == null || translated.isBlank()) translated = sourceText;
+					if (!translated.equals(sourceText)) {
+						client.inGameHud.getChatHud().addMessage(
+								Text.literal("⇄ " + translated).formatted(Formatting.GRAY));
+					}
+					net.mccf.mod.client.history.ChatHistoryManager.record(
+							new net.mccf.mod.client.history.ChatHistoryEntry(
+									parseSenderUuid(senderUuid), speakerName != null ? speakerName : "",
+									sourceText, translated,
+									net.mccf.mod.client.history.ChatHistoryEntry.Source.CLIENT_ONLY,
+									receivedAt, null, null, null));
+				})));
+	}
+
+	/** Called on connect/disconnect and local-mode changes; old callbacks become no-ops. */
+	public static void resetSession() {
+		RESULTS.reset();
 	}
 
 	/**
@@ -189,7 +178,7 @@ public final class ClientOnlyChatTranslator {
 
 		client.execute(() -> {
 			if (client.player == null) return;
-			// 灰色文字提示玩家翻译失败，并附简要原因。reason 可能很长（HTTP 响应体片段），
+			// 灰色文字提示玩家翻译失败，并附简要原因。reason 来自已脱敏的错误描述，仍可能较长，
 			// 截断到 100 字符避免聊天栏被单行错误占满。
 			String truncated = reason != null && reason.length() > 100
 					? reason.substring(0, 100) + "..." : String.valueOf(reason);
@@ -217,7 +206,7 @@ public final class ClientOnlyChatTranslator {
 	 *
 	 * 1.1.2 修复"senderUuid 非 null 但不是合法 UUID 格式时 UUID.fromString 抛
 	 * IllegalArgumentException 被异步调度器吞掉"的问题。某些 Mod 可能修改
-	 * MessageSender 返回非标准 ID，这里捕获异常退化成零 UUID，保证翻译流程继续。
+	 * 调用方传入非标准 ID，这里捕获异常退化成零 UUID，保证翻译流程继续。
 	 */
 	private static UUID parseSenderUuid(String senderUuid) {
 		if (senderUuid == null) return new UUID(0, 0);

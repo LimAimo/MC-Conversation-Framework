@@ -27,8 +27,9 @@ in-person talking:
   hotbar as a HUD subtitle instead. No more "the whole server saw me
   muttering in a corner."
 - **You pick the translation service, you bring your own API key.** Works
-  with OpenAI, Claude, Gemini, DeepL, Kimi, DeepSeek, or a fully local/free
-  option via Ollama. Server admins manage all of this from an in-game
+  with eight real providers: OpenAI, Claude, Gemini, DeepL, Kimi, DeepSeek,
+  Zhipu AI, and Ollama for locally hosted models. Mock is available for debugging.
+  Server admins manage all of this from an in-game
   settings screen — no config file editing, no server restarts.
 - **Don't want the server dictating your translation setup?** You can run
   MCCF client-side only, with your own translation service, even if the
@@ -36,8 +37,7 @@ in-person talking:
   below).
 - **Missed something? Check the chat history.** Subtitles fade away, but
   there's a built-in Chat History screen that lets you scroll back through
-  everything said during the session, automatically grouped by
-  conversation.
+  the latest 500 saved chat messages, grouped by conversation.
 
 ## How do I use it?
 
@@ -66,8 +66,8 @@ in-person talking:
 ## A few things worth knowing before you start
 
 - **Both sides need the mod for the full experience.** If only the server
-  has MCCF installed but your client doesn't, you'll just see the untouched
-  original chat with no translation. If only your client has it and the
+  has MCCF installed but your client doesn't, you receive original text
+  within the server's permitted hearing range, without translation. If only your client has it and the
   server doesn't, you get Client-Only Mode (translation, but no distance/
   line-of-sight logic — see below).
 - **Client-Only Mode is a real, fully independent path**, not a degraded
@@ -76,9 +76,11 @@ in-person talking:
   whatever provider and API key *you* configured — completely separate from
   any server-side setup. You can also force this mode manually even when
   the server *does* have MCCF, if you'd rather manage your own translation
-  settings independently.
+  settings independently. On an MCCF server this changes where translation
+  runs; distance and occlusion rules still apply, and it does not enable
+  server-wide broadcasts.
 - **You need your own API key** for most translation providers (OpenAI,
-  Claude, Gemini, DeepL, Kimi, DeepSeek). The only exception is Ollama,
+  Claude, Gemini, DeepL, Kimi, DeepSeek, Zhipu AI). The only exception is Ollama,
   which runs a model locally on your own machine for free, with no key
   required — but you'll need to set that up yourself first.
 - **Only server operators (op) can change the server-wide translation
@@ -87,7 +89,32 @@ in-person talking:
   from silently changing everyone's translation provider. Your personal
   Client-Only Mode settings, on the other hand, are yours alone to edit,
   regardless of your op status.
-- **This is Minecraft 1.21.1.**
+- **Conversation context follows what both participants actually received.**
+  Joining a group does not reveal earlier messages you missed. Moving away or
+  changing dimensions updates group membership; context and participant lists
+  are filtered by hearing relationships.
+- **Local translation is rate-limited** to five requests per second. Messages
+  already in your language may still use API quota; your own messages are skipped.
+- **This is Minecraft 1.21.1 and requires Java 21.**
+
+## Version 1.2.0 — 2026-10-25
+
+This update fixes spatial group and context isolation, asynchronous message
+ordering and stale callbacks, configuration drafts, context-aware cache
+invalidation, malformed endpoint fallback, and DeepL/Kimi API compatibility.
+It also moves contributor and agent rules to [Agent.md](Agent.md), discoverable
+through [AGENTS.md](AGENTS.md).
+
+After a successful build, use `build/libs/MCConversationFramework-1.2.0.jar`
+in a separate Minecraft 1.21.1 test instance. The sources jar is for development,
+not installation. Automated regression tests use stub providers or a local HTTP
+server and do not require paid API keys. **This update has not been tested in a
+running game or against real paid providers.** Build and test results must be
+reported from the commands actually run.
+
+Kimi currently defaults to `kimi-k2.6`, replacing the discontinued `kimi-k2.5`;
+you can select another available model. The provider uses the model's fixed
+sampling defaults, and thinking controls depend on the selected model.
 
 ## Want the full technical details?
 
@@ -103,3 +130,5 @@ the two documents drifting out of sync.)
 
 If you run into a bug or have a feature request, please open an issue on
 [GitHub Issues](../../issues).
+
+Validation for 1.2.0: Java 21 + Gradle 8.8 `build` passed, with all 61 automated tests passing. In-game and live paid-provider verification remain pending.

@@ -2,33 +2,30 @@ package net.mccf.mod.translation.provider;
 
 import com.google.gson.JsonArray;
 import com.google.gson.JsonObject;
-import com.google.gson.JsonParser;
 import net.mccf.mod.config.ProviderConfig;
 
 import java.util.Map;
+import java.util.List;
 import java.util.concurrent.CompletableFuture;
 
 /**
- * Gemini (Google) 翻译 Provider，使用 generateContent 端点。
+ * 只管 Gemini generateContent 的请求、响应及模型列表；听众和上下文边界由上层决定。
  *
  * Endpoint: POST https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent
  * Auth: x-goog-api-key: <key>
  *
- * 与 OpenAI/Claude 不同，Gemini 没有独立的 system 角色字段（Contents API
- * 里没有 "system"），因此把系统提示词和用户文本拼在同一个 user part 里。
- *
- * 思考控制：默认模型 gemini-3.5-flash 支持通过
- * {@code generationConfig.thinkingConfig.thinkingBudget: 0} 关闭思考——这是
- * Gemini 2.5/3.5 flash 系列沿用的旧参数名（官方 SDK 示例代码确认
- * gemini-3.5-flash 依然接受这个参数，不是新一代的 thinking_level）。
- * **重要限制**：官方文档明确写"Thinking can't be turned off for Gemini
- * 2.5 Pro"，Gemini 3 Pro 同样"thinking cannot be disabled"——如果玩家把
- * 模型手动改成任何 *-pro 型号，这个参数不会报错，但思考也不会真正关闭，
- * 这是 Google API 本身的限制，不是这个开关失效。
+ * 本实现沿用将翻译指令与原文放在同一个 user part 的格式。
+ * 思考控制按模型区分：2.5 Flash 可用 budget=0，2.5 Pro 只能降至最小预算128；
+ * 已知3系列文本模型和4 Argon使用 thinkingLevel=low，不能保证完全关闭思考。
+ * 未识别模型不猜测参数，保留服务端默认值。
+ * 依据：https://ai.google.dev/gemini-api/docs/generate-content/thinking
  */
 public class GeminiTranslationProvider implements TranslationProvider {
 
 	public static final String ID = "gemini";
+	private static final List<String> LOW_THINKING_MODELS = List.of(
+			"gemini-3-flash", "gemini-3.1-flash-lite", "gemini-3.5-flash",
+			"gemini-3.5-flash-lite", "gemini-3.6-flash", "gemini-3.8-flash", "gemini-4-argon");
 
 	private final ProviderConfig config;
 
@@ -58,7 +55,7 @@ public class GeminiTranslationProvider implements TranslationProvider {
 
 		String systemPrompt = ChatCompletionsSupport.buildSystemPrompt(request);
 		String combinedPrompt = systemPrompt + "\n\nText to translate:\n" + request.sourceText();
-		String body = buildRequestBody(combinedPrompt, config.disableThinking);
+		String body = buildRequestBody(model, combinedPrompt, config.disableThinking);
 
 		return HttpProviderSupport.postJson(endpoint, body, Map.of(
 				"x-goog-api-key", config.apiKey,
@@ -80,10 +77,10 @@ public class GeminiTranslationProvider implements TranslationProvider {
 
 	/** Gemini 模型列表响应：{"models":[{"name":"models/gemini-2.5-pro",...}]}，name 需去掉 "models/" 前缀。 */
 	private static java.util.List<String> parseModelListResponse(String responseBody) {
-		JsonObject root = JsonParser.parseString(responseBody).getAsJsonObject();
+		JsonObject root = HttpProviderSupport.parseResponseJson(responseBody);
 		JsonArray models = root.getAsJsonArray("models");
 		if (models == null) {
-			throw new RuntimeException("No models array in Gemini response: " + responseBody);
+			throw new RuntimeException("No models array in Gemini response");
 		}
 		java.util.List<String> ids = new java.util.ArrayList<>();
 		for (var element : models) {
@@ -97,10 +94,24 @@ public class GeminiTranslationProvider implements TranslationProvider {
 		return ids;
 	}
 
-	private static String buildRequestBody(String promptText, boolean disableThinking) {
-		String thinkingField = disableThinking
-				? ",\"generationConfig\":{\"thinkingConfig\":{\"thinkingBudget\":0}}"
-				: "";
+	static String buildRequestBody(String model, String promptText, boolean disableThinking) {
+		String thinkingConfig = "";
+		if (disableThinking) {
+			if (model.startsWith("gemini-2.5-flash")) {
+				thinkingConfig = "\"thinkingBudget\":0";
+			} else if (model.equals("gemini-2.5-pro") || model.startsWith("gemini-2.5-pro-")) {
+				thinkingConfig = "\"thinkingBudget\":128";
+			} else if (model.startsWith("gemini-3.1-flash-lite-image")) {
+				// This variant accepts minimal/high but rejects low; never send a blanket level.
+				thinkingConfig = "\"thinkingLevel\":\"minimal\"";
+			} else if (!model.contains("-image") && LOW_THINKING_MODELS.stream()
+					.anyMatch(base -> model.equals(base) || model.startsWith(base + "-"))) {
+				// Low works across the documented text variants, whereas minimal rejects 3.8 Flash.
+				thinkingConfig = "\"thinkingLevel\":\"low\"";
+			}
+		}
+		String thinkingField = thinkingConfig.isEmpty() ? ""
+				: ",\"generationConfig\":{\"thinkingConfig\":{" + thinkingConfig + "}}";
 		return "{"
 				+ "\"contents\":[{\"parts\":[{\"text\":\"" + HttpProviderSupport.escapeJson(promptText) + "\"}]}]"
 				+ thinkingField
@@ -109,15 +120,15 @@ public class GeminiTranslationProvider implements TranslationProvider {
 
 	/** 解析响应：candidates[0].content.parts[0].text */
 	private static String parseGenerateContentResponse(String responseBody) {
-		JsonObject root = JsonParser.parseString(responseBody).getAsJsonObject();
+		JsonObject root = HttpProviderSupport.parseResponseJson(responseBody);
 		JsonArray candidates = root.getAsJsonArray("candidates");
 		if (candidates == null || candidates.isEmpty()) {
-			throw new RuntimeException("No candidates in Gemini response: " + responseBody);
+			throw new RuntimeException("No candidates in Gemini response");
 		}
 		JsonObject content = candidates.get(0).getAsJsonObject().getAsJsonObject("content");
 		JsonArray parts = content.getAsJsonArray("parts");
 		if (parts == null || parts.isEmpty()) {
-			throw new RuntimeException("No parts in Gemini response: " + responseBody);
+			throw new RuntimeException("No parts in Gemini response");
 		}
 		return parts.get(0).getAsJsonObject().get("text").getAsString().trim();
 	}

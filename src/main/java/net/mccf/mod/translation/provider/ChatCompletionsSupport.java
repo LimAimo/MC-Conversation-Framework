@@ -2,7 +2,6 @@ package net.mccf.mod.translation.provider;
 
 import com.google.gson.JsonArray;
 import com.google.gson.JsonObject;
-import com.google.gson.JsonParser;
 
 import java.util.List;
 
@@ -80,44 +79,40 @@ public final class ChatCompletionsSupport {
 	}
 
 	/**
-	 * 构造标准 OpenAI Chat Completions 请求体，可选注入"关闭思考"参数。
-	 *
-	 * disableThinking 为 true 时，在请求体里加一个 {@code "thinking":{"type":"disabled"}}
-	 * 字段——这是 DeepSeek（V4 系列）、Kimi（K2.x 系列）、智谱 GLM 系列共用的关闭
-	 * 思考模式参数结构（都是从 Anthropic Messages API 的 thinking 参数演化而来，
-	 * 三家在各自 OpenAI 兼容接口上沿用了同样的字段名和结构）。
-	 *
-	 * 重要限制（应用户明确要求，实现前已充分调研）：这个参数对每家、每个模型代次
-	 * 的支持程度不一致——
-	 * - DeepSeek V4 系列：官方文档确认支持，默认开启思考，可用此参数关闭。
-	 * - Kimi K2.x 系列（如默认的 kimi-k2.5）：支持；但 K3 系列官方文档明确写
-	 *   "Reasoning is always on. There is no non-thinking mode."——对 K3 传这个
-	 *   参数不会报错，但也不会生效，思考依然会发生。
-	 * - 智谱 GLM 系列：GLM-5 / GLM-5.2 官方示例代码确认支持。
-	 * 没有任何官方 API 能查询"某个具体模型是否真的支持关闭思考"，所以这里不做
-	 * 模型名的智能判断——玩家打开"强制关闭思考"开关时，配置界面会展示一次性的
-	 * 警告说明这个限制（见 ServerConfigPanel/LocalConfigPanel 里的确认弹窗），
-	 * 至于具体某个模型是否真的生效，交给玩家自己判断和验证。
+	 * 构造兼容 Chat Completions 的请求体，可选注入 {@code thinking.type=disabled}。
+	 * 这个扩展字段并非所有模型都支持，调用的 Provider 负责根据模型约束决定是否发送。
+	 * 固定采样参数的模型应使用 {@link #buildRequestBodyWithDefaultSampling}。
 	 */
 	public static String buildRequestBody(String model, String systemPrompt, String userText, boolean disableThinking) {
+		return buildRequestBody(model, systemPrompt, userText, disableThinking, true);
+	}
+
+	/** Let the provider select sampling defaults when models enforce their own temperature. */
+	public static String buildRequestBodyWithDefaultSampling(String model, String systemPrompt,
+			String userText, boolean disableThinking) {
+		return buildRequestBody(model, systemPrompt, userText, disableThinking, false);
+	}
+
+	private static String buildRequestBody(String model, String systemPrompt, String userText,
+			boolean disableThinking, boolean includeTemperature) {
 		String thinkingField = disableThinking ? ",\"thinking\":{\"type\":\"disabled\"}" : "";
 		return "{"
 				+ "\"model\":\"" + HttpProviderSupport.escapeJson(model) + "\","
 				+ "\"messages\":["
 				+ "{\"role\":\"system\",\"content\":\"" + HttpProviderSupport.escapeJson(systemPrompt) + "\"},"
 				+ "{\"role\":\"user\",\"content\":\"" + HttpProviderSupport.escapeJson(userText) + "\"}"
-				+ "],"
-				+ "\"temperature\":0.3"
+				+ "]"
+				+ (includeTemperature ? ",\"temperature\":0.3" : "")
 				+ thinkingField
 				+ "}";
 	}
 
 	/** 解析标准 OpenAI Chat Completions 响应：choices[0].message.content。 */
 	public static String parseChatCompletionResponse(String responseBody) {
-		JsonObject root = JsonParser.parseString(responseBody).getAsJsonObject();
+		JsonObject root = HttpProviderSupport.parseResponseJson(responseBody);
 		JsonArray choices = root.getAsJsonArray("choices");
 		if (choices == null || choices.isEmpty()) {
-			throw new RuntimeException("No choices in response: " + responseBody);
+			throw new RuntimeException("No choices in response");
 		}
 		JsonObject message = choices.get(0).getAsJsonObject().getAsJsonObject("message");
 		return message.get("content").getAsString().trim();
@@ -131,10 +126,10 @@ public final class ChatCompletionsSupport {
 	 * 兼容了 OpenAI 的模型列表 schema），所以 Claude 也复用这里。
 	 */
 	public static List<String> parseModelListResponse(String responseBody) {
-		JsonObject root = JsonParser.parseString(responseBody).getAsJsonObject();
+		JsonObject root = HttpProviderSupport.parseResponseJson(responseBody);
 		JsonArray data = root.getAsJsonArray("data");
 		if (data == null) {
-			throw new RuntimeException("No data array in models response: " + responseBody);
+			throw new RuntimeException("No data array in models response");
 		}
 		List<String> ids = new java.util.ArrayList<>();
 		for (var element : data) {

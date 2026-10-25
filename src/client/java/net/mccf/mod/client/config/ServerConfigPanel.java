@@ -32,6 +32,15 @@ import net.minecraft.util.Colors;
 public class ServerConfigPanel extends ProviderConfigPanel {
 
 	private final ClientConfigState state = ClientConfigState.get();
+	private final ProviderConfigDrafts drafts;
+	public static final class DraftState {
+		final ProviderConfigDrafts providers = new ProviderConfigDrafts();
+		String pendingModelsProvider;
+		String pendingModelsRequestId;
+		/** Shared with rebuilt panels so request timeouts survive a resize. */
+		long snapshotRequestedAtMillis;
+	}
+	private final DraftState draftState;
 
 	/** 请求快照后多久（毫秒）算超时——超时后不再显示"加载中"，改为提示未安装/无法连接 + 重试按钮。 */
 	private static final long SNAPSHOT_TIMEOUT_MS = 5000;
@@ -52,7 +61,7 @@ public class ServerConfigPanel extends ProviderConfigPanel {
 	/**
 	 * "强制关闭思考"开关——只在 selectedProvider 属于
 	 * {@link ClientConfigState#THINKING_CAPABLE_PROVIDERS} 时可见（其余
-	 * Provider 没有"思考"概念，见该集合注释）。每个 Provider 各自独立存储
+	 * Provider 尚未接入该开关，见该集合注释）。每个 Provider 各自独立存储
 	 * 在 {@code ClientProviderConfig#disableThinking} 里（应用户明确要求
 	 * "只想关 DeepSeek 的思考，不想关 Kimi 的"这类精细控制），不是全局开关。
 	 */
@@ -60,22 +69,12 @@ public class ServerConfigPanel extends ProviderConfigPanel {
 
 	private Text statusMessage = Text.empty();
 	private int statusColor = Colors.YELLOW;
-	/** 玩家是否点了"清除密钥"按钮，语义同旧版 MCCFConfigScreen。 */
-	private boolean userClearedApiKey = false;
-	/**
-	 * 最近一次向服务端请求配置快照的时刻（{@link System#currentTimeMillis()}）。
-	 * 用于在 {@link #renderExtra} 里判断是否已经等待超过 {@link #SNAPSHOT_TIMEOUT_MS}
-	 * 仍未收到回包——这种情况通常意味着服务器没有安装 MCCF（能连接、能发送请求，
-	 * 但服务端不认识这个通道/不会回应），而不是"还在加载中"。0 表示尚未发送过请求
-	 * （理论上不会发生，构造器里 canSend 检查通过就会立即请求一次；但如果玩家在
-	 * 未连接任何服务器时打开过配置界面，这个值会保持 0，此时也不应该显示超时提示，
-	 * 因为压根没发出去请求，见 renderExtra 里的判断）。
-	 */
-	private long snapshotRequestedAtMillis = 0;
-
-	public ServerConfigPanel(Screen screen, int left, int top, int right, int bottom, int screenCenterY) {
+	public ServerConfigPanel(Screen screen, int left, int top, int right, int bottom, int screenCenterY,
+			DraftState draftState) {
 		super(screen, left, top, right, bottom, screenCenterY);
-		requestSnapshot();
+		this.draftState = draftState;
+		this.drafts = draftState.providers;
+		drafts.mergeSnapshot(state.providers);
 	}
 
 	/**
@@ -86,10 +85,10 @@ public class ServerConfigPanel extends ProviderConfigPanel {
 	 * LocalConfigPanel 处理"未连接时不显示检测行"是同一个思路：没有连接这件事
 	 * 本身不构成"加载"或"超时"，就不该显示任何相关状态）。
 	 */
-	private void requestSnapshot() {
+	public void requestSnapshot() {
 		if (ClientPlayNetworking.canSend(RequestConfigPayload.ID)) {
 			ClientPlayNetworking.send(new RequestConfigPayload(true));
-			snapshotRequestedAtMillis = System.currentTimeMillis();
+			draftState.snapshotRequestedAtMillis = System.currentTimeMillis();
 		}
 	}
 
@@ -143,7 +142,7 @@ public class ServerConfigPanel extends ProviderConfigPanel {
 		// 运行时状态就是对的，不用等第一次 refreshFieldsFromState 才更新）。
 		// 打开开关（false -> true）时会弹出确认警告，见 onDisableThinkingToggled——
 		// 应用户明确要求"警告屏幕"说明部分模型可能不支持、以及关闭思考的好处。
-		ClientProviderConfig initialPc = state.getOrCreate(selectedProvider);
+		ClientProviderConfig initialPc = draft(selectedProvider);
 		disableThinkingButton = own(net.minecraft.client.gui.widget.CyclingButtonWidget.onOffBuilder(initialPc.disableThinking)
 				.build(panelLeft, y, panelWidth, fieldHeight,
 						Text.translatable("mccf.config.disable_thinking"),
@@ -207,9 +206,6 @@ public class ServerConfigPanel extends ProviderConfigPanel {
 
 	@Override
 	protected void onProviderSelected(String providerId) {
-		// 切换查看时重置"清除密钥"标记——每个 Provider 的 Key 独立保存，
-		// 玩家在 A Provider 点了清除不意味着切到 B Provider 也想清除 B 的 Key。
-		userClearedApiKey = false;
 		refreshFieldsFromState();
 		applyEditability();
 
@@ -219,10 +215,10 @@ public class ServerConfigPanel extends ProviderConfigPanel {
 		// 选中就弹窗会打断"随便点点看看"的浏览行为，体验上过于侵入。
 	}
 
-	/** 把 state 里当前查看 Provider 的数据填入输入框。 */
+	/** Fill widgets from the screen-owned draft, separate from the latest server snapshot. */
 	private void refreshFieldsFromState() {
 		if (apiKeyField == null) return; // buildRightPanel 尚未跑完（初次 init 时序）
-		ClientProviderConfig pc = state.getOrCreate(selectedProvider);
+		ClientProviderConfig pc = draft(selectedProvider);
 		apiKeyField.setText(pc.apiKey == null ? "" : pc.apiKey);
 		modelField.setText(pc.model == null ? "" : pc.model);
 		endpointField.setText(pc.endpoint == null ? "" : pc.endpoint);
@@ -242,6 +238,25 @@ public class ServerConfigPanel extends ProviderConfigPanel {
 			disableThinkingButton.visible = supportsThinking && tabVisible;
 			disableThinkingButton.setValue(pc.disableThinking);
 		}
+	}
+
+	private ClientProviderConfig draft(String providerId) {
+		return drafts.get(providerId, state.getOrCreate(providerId));
+	}
+
+	@Override
+	public void captureDraft() {
+		if (apiKeyField == null || selectedProvider == null) return;
+		ClientProviderConfig pc = draft(selectedProvider);
+		pc.apiKey = apiKeyField.getText();
+		if (!pc.apiKey.isBlank()) pc.clearApiKey = false;
+		pc.model = modelField.getText();
+		String endpoint = endpointField.getText();
+		if (!endpoint.equals(pc.endpoint) && !endpoint.isBlank()) {
+			pc.endpointAction = ClientProviderConfig.EndpointAction.CUSTOM;
+			pc.isCustomEndpoint = true;
+		}
+		pc.endpoint = endpoint;
 	}
 
 	private void applyEditability() {
@@ -287,7 +302,7 @@ public class ServerConfigPanel extends ProviderConfigPanel {
 		}
 		if (fetchModelsButton != null) {
 			fetchModelsButton.visible = tabVisible && !hideProviderControls;
-			fetchModelsButton.active = tabVisible && canEdit && supportsModelList;
+			fetchModelsButton.active = tabVisible && canEdit && supportsModelList && draftState.pendingModelsProvider == null;
 		}
 		saveButton.visible = tabVisible && !hideSaveButton;
 		saveButton.active = tabVisible && canEdit;
@@ -304,6 +319,7 @@ public class ServerConfigPanel extends ProviderConfigPanel {
 	@Override
 	protected void onTabVisibilityChanged() {
 		if (apiKeyField == null) return; // 尚未 buildRightPanel
+		if (!tabVisible) draftState.pendingModelsProvider = null;
 		applyEditability();
 		// retryButton 的可见性平时完全由 renderExtra 每帧根据超时状态计算——但
 		// renderExtra 只在这个标签页是当前活动标签时才会被调用（见该方法开头的
@@ -321,11 +337,13 @@ public class ServerConfigPanel extends ProviderConfigPanel {
 
 	/** 收到服务端最新快照后调用。 */
 	public void onSnapshotUpdated() {
+		captureDraft();
+		drafts.mergeSnapshot(state.providers);
 		// 收到了真实回包，不再是"等待中/超时"状态——归零计时，renderExtra 里
 		// hasReceivedSnapshot 已经为 true，会走"显示 statusMessage"分支，
 		// 但归零这个字段仍有意义：万一以后新增"重新连接后再次显示加载"之类
 		// 的场景，这个字段的状态要保持干净，不留一个过期的历史时间戳。
-		snapshotRequestedAtMillis = 0;
+		draftState.snapshotRequestedAtMillis = 0;
 		// 1.1.7 修复：服务端切换 Provider 后选中框不跟随 + 不滚动的问题。
 		//
 		// 1.1.4 删除了 `selectedProvider = state.activeProvider`（防止 init 重建后
@@ -365,7 +383,14 @@ public class ServerConfigPanel extends ProviderConfigPanel {
 	}
 
 	/** 收到服务端模型列表查询结果后调用。 */
-	public void onModelsResult(boolean success, String providerId, java.util.List<String> models, String error) {
+	public void onModelsResult(boolean success, String requestId, String providerId, java.util.List<String> models, String error) {
+		// Ignore responses belonging to a request made in another panel/session.
+		if (draftState.pendingModelsProvider == null) return;
+		// Older servers omit requestId; their provider check remains the compatibility fallback.
+		if (!requestId.isBlank() && !requestId.equals(draftState.pendingModelsRequestId)) return;
+		if (!providerId.equals(draftState.pendingModelsProvider) && (success || !providerId.isBlank())) return;
+		draftState.pendingModelsProvider = null;
+		if (fetchModelsButton != null) applyEditability();
 		if (success) {
 			if (models.isEmpty()) {
 				statusMessage = Text.translatable("mccf.config.models_empty");
@@ -375,9 +400,11 @@ public class ServerConfigPanel extends ProviderConfigPanel {
 			statusMessage = Text.translatable("mccf.config.models_opened");
 			statusColor = Colors.YELLOW;
 			if (MinecraftClient.getInstance() != null) {
-				String currentModel = state.getOrCreate(providerId).model;
+				captureDraft();
+				String currentModel = draft(providerId).model;
 				MinecraftClient.getInstance().setScreen(
-						new ModelSelectionScreen(screen, providerId, models, currentModel, this::setModelFromSelection));
+						new ModelSelectionScreen(screen, providerId, models, currentModel,
+								model -> setModelFromSelection(providerId, model)));
 			}
 		} else {
 			statusMessage = Text.translatable("mccf.config.fetch_failed", error);
@@ -385,30 +412,17 @@ public class ServerConfigPanel extends ProviderConfigPanel {
 		}
 	}
 
-	/**
-	 * ModelSelectionScreen 选中模型后的回调。
-	 *
-	 * 1.1.3 修复：用方法参数 providerId 而不是 selectedProvider 字段写入 state——
-	 * ModelSelectionScreen 关闭可能触发 init() 重建，新 panel 的 selectedProvider
-	 * 可能和发起获取模型时的旧 panel 不同（虽然 1.1.3 的 preservedSelectedProvider
-	 * 修复已经让两者一致，但用 providerId 参数更明确、不依赖 panel 实例状态）。
-	 * modelField.setText 仍然只在 modelField 非 null 时调用——重建后旧 panel 的
-	 * modelField 已被丢弃，新 panel 的 modelField 会通过 refreshFieldsFromState
-	 * 从 state（已被这里写入）读取最新值，不需要旧 panel 手动 setText。
-	 */
-	public void setModelFromSelection(String model) {
-		// providerId 由 onModelsResult 创建 ModelSelectionScreen 时传入，固定为
-		// 发起获取模型时玩家选中的 Provider，不随 panel 重建变化。
-		String providerId = selectedProvider;
-		state.getOrCreate(providerId).model = model;
-		if (modelField != null) {
+	/** The callback is bound to the provider that started the request, even after a selection change. */
+	public void setModelFromSelection(String providerId, String model) {
+		draft(providerId).model = model;
+		if (providerId.equals(selectedProvider) && modelField != null) {
 			modelField.setText(model);
 		}
 	}
 
 	private void onResetEndpoint() {
 		if (!state.canEdit) return;
-		ClientProviderConfig pc = state.getOrCreate(selectedProvider);
+		ClientProviderConfig pc = draft(selectedProvider);
 		pc.endpoint = "";
 		pc.isCustomEndpoint = false;
 		pc.endpointAction = ClientProviderConfig.EndpointAction.RESET_DEFAULT;
@@ -429,31 +443,25 @@ public class ServerConfigPanel extends ProviderConfigPanel {
 	 * 关闭（true -> false）不需要确认——关掉一个"可能有风险的设置"永远是
 	 * 安全的操作，不用像打开那样拦截一次。
 	 *
-	 * 没有联网/API 查询能判断"当前这个具体模型是否真的支持关闭思考"（调研
-	 * 过 DeepSeek/Kimi/Claude/Gemini/智谱，没有任何一家的 listModels 接口
-	 * 返回这个信息），所以警告是通用的、不针对具体模型名做智能判断——具体
-	 * 某个模型是否真的支持，需要玩家自己验证。
+     * 本实现尚未查询模型能力元数据，不能仅凭 Provider 名称保证具体模型支持关闭。
+     * 例如 Claude Models API 和 Ollama /api/show 可提供能力信息，但这里未接入；
+     * 当前仍提示用户核对模型限制，Provider 实现仅发送已知兼容的参数。
 	 */
 	private void onDisableThinkingToggled(net.minecraft.client.gui.widget.CyclingButtonWidget<Boolean> button, boolean newValue) {
+		captureDraft();
+		String providerId = selectedProvider;
 		if (!newValue) {
 			// 关闭：直接生效，不需要确认。
-			state.getOrCreate(selectedProvider).disableThinking = false;
+			draft(providerId).disableThinking = false;
 			return;
 		}
 
+		draftState.pendingModelsProvider = null;
 		MinecraftClient.getInstance().setScreen(new net.minecraft.client.gui.screen.ConfirmScreen(
 				confirmed -> {
-					// 必须先更新状态，再 setScreen 切回配置界面——setScreen 会触发
-					// MCCFConfigScreen.init() 重建所有面板控件，重建时 refreshFieldsFromState
-					// 会从 state 读取 disableThinking 的值来设置按钮显示。如果先 setScreen
-					// 再改状态，init 重建读到的还是旧值 false，按钮就显示"关"；等状态改成
-					// true 时按钮已经画完了，不会再刷新——这就是"点'是'后仍显示关"的根因。
-					// 旧代码反过来了（先 setScreen 后改状态），1.1.1 修复。
-					// 取消分支不需要手动 button.setValue(false)——init 重建会创建全新的
-					// 按钮 widget，lambda 里捕获的 button 是旧 widget，操作它没有意义；
-					// 新按钮会从 state（仍是 false）正确读取并显示"关"。
+					// Update the shared draft before rebuilding widgets on the parent screen.
 					if (confirmed) {
-						state.getOrCreate(selectedProvider).disableThinking = true;
+						draft(providerId).disableThinking = true;
 					}
 					MinecraftClient.getInstance().setScreen(screen);
 				},
@@ -464,25 +472,35 @@ public class ServerConfigPanel extends ProviderConfigPanel {
 	private void onClearApiKey() {
 		if (!state.canEdit) return;
 		apiKeyField.setText("");
-		userClearedApiKey = true;
+		draft(selectedProvider).apiKey = "";
+		draft(selectedProvider).clearApiKey = true;
 		statusMessage = Text.translatable("mccf.config.api_key_cleared");
 		statusColor = Colors.YELLOW;
 	}
 
 	private void onFetchModels() {
 		if (!state.canEdit) return;
+		if (draftState.pendingModelsProvider != null) return;
 		if (!ClientPlayNetworking.canSend(RequestModelsPayload.ID)) {
 			statusMessage = Text.translatable("mccf.config.not_connected");
 			statusColor = Colors.YELLOW;
 			return;
 		}
 
+		captureDraft();
+		ClientProviderConfig currentDraft = draft(selectedProvider);
 		com.google.gson.JsonObject requestRoot = new com.google.gson.JsonObject();
+		draftState.pendingModelsRequestId = java.util.UUID.randomUUID().toString();
+		requestRoot.addProperty("requestId", draftState.pendingModelsRequestId);
 		requestRoot.addProperty("providerId", selectedProvider);
 		requestRoot.addProperty("apiKey", apiKeyField.getText());
 		requestRoot.addProperty("endpoint", endpointField.getText());
+		requestRoot.addProperty("clearApiKey", currentDraft.clearApiKey);
+		requestRoot.addProperty("resetEndpoint", currentDraft.endpointAction == ClientProviderConfig.EndpointAction.RESET_DEFAULT);
 
 		ClientPlayNetworking.send(new RequestModelsPayload(requestRoot.toString()));
+		draftState.pendingModelsProvider = selectedProvider;
+		fetchModelsButton.active = false;
 		statusMessage = Text.translatable("mccf.config.fetching_models");
 		statusColor = Colors.YELLOW;
 	}
@@ -509,17 +527,10 @@ public class ServerConfigPanel extends ProviderConfigPanel {
 		// 1.1.5 Mock 警告（B1c 第二步）：保存 Mock 时弹确认屏幕。
 		// 已保存 Mock（activeProvider == mock）不弹——玩家已经确认过了。
 		if (selectedProvider.equals("mock") && !"mock".equals(state.activeProvider)) {
+			draftState.pendingModelsProvider = null;
 			MinecraftClient.getInstance().setScreen(new net.minecraft.client.gui.screen.ConfirmScreen(
 					confirmed -> {
-						// 1.1.7 修复：必须先 setScreen 后 performSave（和 LocalConfigPanel 一致）。
-						// 旧版顺序相反（先 performSave 后 setScreen），setScreen 触发 init 重建，
-						// 新 panel 构造函数调 requestSnapshot() 发 RequestConfigPayload。服务端回的
-						// ConfigSnapshotPayload 触发 applySnapshot，第81行 pendingActiveProvider 被重置
-						// 为 activeProvider——如果 requestSnapshot 回包在 UpdateConfigPayload 的
-						// broadcast 之前到达，state 会被临时重置回旧值，导致第一次点确认"不应用"。
-						// 改为先 setScreen（触发 init 重建 + requestSnapshot），然后通过
-						// triggerServerPerformSave 在新 panel 上执行 performSave——确保 performSave
-						// 在 init 重建之后执行，且读的是新 panel 的字段。
+						// Save through the rebuilt panel, which reads the same parent-owned draft.
 						MinecraftClient.getInstance().setScreen(screen);
 						if (confirmed && screen instanceof MCCFConfigScreen mccf) {
 							mccf.triggerServerPerformSave();
@@ -545,30 +556,10 @@ public class ServerConfigPanel extends ProviderConfigPanel {
 
 	/** 实际执行保存——从 onSave 抽取，供 Mock 确认回调和正常路径共用。 */
 	private void performSave() {
-		ClientProviderConfig pc = state.getOrCreate(selectedProvider);
-		String enteredKey = apiKeyField.getText();
-		if (userClearedApiKey) {
-			pc.apiKey = "";
-		} else if (!enteredKey.isBlank()) {
-			pc.apiKey = enteredKey;
-		}
-		userClearedApiKey = false;
+		captureDraft();
+		ClientProviderConfig pc = draft(selectedProvider);
 
-		pc.model = modelField.getText();
-		String enteredEndpoint = endpointField.getText();
-		pc.endpoint = enteredEndpoint;
-		if (!enteredEndpoint.isBlank()) {
-			pc.endpointAction = ClientProviderConfig.EndpointAction.CUSTOM;
-			pc.isCustomEndpoint = true;
-		} else if (pc.endpointAction != ClientProviderConfig.EndpointAction.RESET_DEFAULT) {
-			pc.endpointAction = ClientProviderConfig.EndpointAction.UNCHANGED;
-			pc.isCustomEndpoint = false;
-		}
-
-		// 保存 = 同时把当前查看的 Provider 设为激活目标，见方法注释。
-		state.pendingActiveProvider = selectedProvider;
-
-		ClientPlayNetworking.send(new UpdateConfigPayload(state.buildUpdateJson()));
+		ClientPlayNetworking.send(new UpdateConfigPayload(state.buildUpdateJson(selectedProvider, pc)));
 		statusMessage = Text.translatable("mccf.config.saving");
 		statusColor = Colors.YELLOW;
 	}
@@ -635,10 +626,10 @@ public class ServerConfigPanel extends ProviderConfigPanel {
 		}
 
 		// 三态判断（快照请求状态），同 1.1.2 逻辑
-		boolean neverRequested = snapshotRequestedAtMillis == 0;
+		boolean neverRequested = draftState.snapshotRequestedAtMillis == 0;
 		boolean timedOut = !neverRequested
 				&& !state.hasReceivedSnapshot
-				&& System.currentTimeMillis() - snapshotRequestedAtMillis > SNAPSHOT_TIMEOUT_MS;
+				&& System.currentTimeMillis() - draftState.snapshotRequestedAtMillis > SNAPSHOT_TIMEOUT_MS;
 
 		HintLine statusLine;
 		if (state.hasReceivedSnapshot) {

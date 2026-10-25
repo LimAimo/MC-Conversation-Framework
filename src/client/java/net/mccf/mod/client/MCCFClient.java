@@ -57,6 +57,7 @@ public class MCCFClient implements ClientModInitializer {
 
 	private static KeyBinding openConfigKey;
 	private static KeyBinding openHistoryKey;
+	private String lastReportedLanguage;
 
 	/**
 	 * 首次启动提示是否已经发过。1.1.2 起从内存 static boolean 改为持久化到
@@ -91,7 +92,7 @@ public class MCCFClient implements ClientModInitializer {
 
 		ClientPlayNetworking.registerGlobalReceiver(SubtitlePayload.ID, (payload, context) ->
 				context.client().execute(() -> {
-					// 说话者是不是自己：SpatialChatHandler#dispatchSelfEcho 会给说话者本人发一份
+					// 说话者是不是自己：SpatialChatHandler 的回显分支 会给说话者本人发一份
 					// 原文回显包（speakerId == 自己的 UUID，displayMode 跟随本次发言时其他听众的
 					// 主导模式，见该方法注释）。这个分支必须最先判断——自己的回显不该走
 					// "仅译文一行"格式（那是给别人消息设计的），也不该被当成"我收到了自己说的话"
@@ -104,9 +105,9 @@ public class MCCFClient implements ClientModInitializer {
 						// 玩家显然知道自己说了什么，这里只是让消息重新出现在自己的视野里
 						// （因为 SpatialChatHandler 拦截了原版广播，不补这一条自己就完全看不到）。
 						// VISIBLE（多数听众能看到我）走聊天框，AUDIBLE（多数听众只能听到）走
-						// 物品栏字幕——与 SpatialChatHandler#dispatchSelfEcho 的"跟随主导模式"
+						// 物品栏字幕——与 SpatialChatHandler 的回显分支 的"跟随主导模式"
 						// 逻辑对应，让自己的回显形式与当前对话情境（面对面 / 隔墙喊话）一致。
-						if ("AUDIBLE".equals(payload.displayMode())) {
+						if (!ClientOnlyModeManager.isClientOnlyModeActive() && "AUDIBLE".equals(payload.displayMode())) {
 							SubtitleManager.onReceive(payload);
 						} else {
 							addVisibleToChatHud(payload.speakerName(), payload.originalText());
@@ -127,8 +128,7 @@ public class MCCFClient implements ClientModInitializer {
 					// 听众发 SubtitlePayload"路径，以及旧服务端退回方案），原版广播被服务端拦截，
 					// client-only 听众收不到原版 CHAT 事件，ChatHud 里不会有原文。必须在这里
 					// 手动 addVisibleToChatHud 显示原文，否则玩家只看到翻译追加行看不到原文。
-					// 说话者也是 client-only 时 onChatMessage return true 放行原版广播，不会走到
-					// 这里（dispatchTo 不被调用），所以不会出现"原版 CHAT + 这里手动"重复显示。
+					// MCCF 服务端对所有说话者统一拦截，client-only 听众也从这里接收原文。
 					String sourceText = payload.originalText();
 					if (sourceText == null || sourceText.isBlank()) sourceText = payload.translatedText();
 					if (sourceText != null && !sourceText.isBlank()) {
@@ -219,27 +219,29 @@ public class MCCFClient implements ClientModInitializer {
 						com.google.gson.JsonObject root =
 								com.google.gson.JsonParser.parseString(payload.json()).getAsJsonObject();
 						boolean success = root.has("success") && root.get("success").getAsBoolean();
+						String requestId = root.has("requestId") ? root.get("requestId").getAsString() : "";
 						String providerId = root.has("providerId") ? root.get("providerId").getAsString() : "";
 						if (success) {
 							java.util.List<String> models = new java.util.ArrayList<>();
 							if (root.has("models")) {
 								root.getAsJsonArray("models").forEach(e -> models.add(e.getAsString()));
 							}
-							screen.onModelsResult(true, providerId, models, null);
+							screen.onModelsResult(true, requestId, providerId, models, null);
 						} else {
 							String error = root.has("error") ? root.get("error").getAsString() : "Unknown error";
-							screen.onModelsResult(false, providerId, java.util.List.of(), error);
+							screen.onModelsResult(false, requestId, providerId, java.util.List.of(), error);
 						}
 					} catch (Exception e) {
-						screen.onModelsResult(false, "", java.util.List.of(), "Failed to parse response.");
+						screen.onModelsResult(false, "", "", java.util.List.of(), "Failed to parse response.");
 					}
 				}));
 
 		// 每次加入服务器（含切换服务器）时上报当前客户端语言设置，并刷新
 		// "服务器是否装了 MCCF" 的自动检测结果（纯客户端模式判定的依据之一）。
 		ClientPlayConnectionEvents.JOIN.register((handler, sender, client) -> {
-			String language = detectClientLanguage(client);
-			ClientPlayNetworking.send(new LanguageReportPayload(language));
+			ClientOnlyChatTranslator.resetSession();
+			lastReportedLanguage = null;
+			reportLanguageIfChanged(client);
 			ClientOnlyModeManager.onJoinServer();
 
 			// O1 首次启动提示：本 Mod 的配置按键没有默认绑定，玩家装完可能完全不知道
@@ -264,6 +266,9 @@ public class MCCFClient implements ClientModInitializer {
 		// 仍要清空（它是服务端下发的实时数据，断连后失效），但 ChatHistoryManager
 		// 里缓存的参与者名单（PARTICIPANTS_CACHE）不受影响，分组标题仍能正常显示。
 		ClientPlayConnectionEvents.DISCONNECT.register((handler, client) -> {
+			ClientOnlyChatTranslator.resetSession();
+			ClientConfigState.get().resetConnection();
+			lastReportedLanguage = null;
 			SubtitleManager.clear();
 			net.mccf.mod.client.history.ConversationRosterManager.clear();
 			ClientOnlyModeManager.onDisconnect();
@@ -290,6 +295,7 @@ public class MCCFClient implements ClientModInitializer {
 		));
 
 		ClientTickEvents.END_CLIENT_TICK.register(client -> {
+			reportLanguageIfChanged(client);
 			while (openConfigKey.wasPressed()) {
 				if (client.currentScreen == null) {
 					client.setScreen(new MCCFConfigScreen(null));
@@ -306,6 +312,15 @@ public class MCCFClient implements ClientModInitializer {
 		// GameMenuScreenMixin。不在这里用 ScreenEvents.afterInit 是因为
 		// Screen.addDrawableChild 是 protected，外部包无法调用——Mixin 把代码
 		// 注入到 GameMenuScreen 内部才能合法调用 protected 方法。
+	}
+
+	private void reportLanguageIfChanged(MinecraftClient client) {
+		if (client.player == null || !ClientPlayNetworking.canSend(LanguageReportPayload.ID)) return;
+		String language = detectClientLanguage(client);
+		if (!language.equals(lastReportedLanguage)) {
+			ClientPlayNetworking.send(new LanguageReportPayload(language));
+			lastReportedLanguage = language;
+		}
 	}
 
 	private String detectClientLanguage(MinecraftClient client) {

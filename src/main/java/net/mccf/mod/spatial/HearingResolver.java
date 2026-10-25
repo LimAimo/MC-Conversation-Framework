@@ -14,7 +14,7 @@ import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
 
 /**
- * 判定"谁能听到" / "谁能看到"说话者，是整个空间化系统的地基。
+ * 这个类只管谁能听到或看到说话者及短期射线缓存，不管理对话组和网络分发。
  *
  * 三档结果对应设计文档的空间化分发规则：
  * - VISIBLE:  在 subtitleVisibleRange 内 且 视线未被方块完全阻挡 -> 走原版聊天栏
@@ -53,13 +53,15 @@ public class HearingResolver {
 	 * 没法区分 (A 说给 B) 和 (B 说给 A)，用嵌套结构能让两层 key 的语义各自明确。
 	 * 外层 speaker 是"每次聊天都在变的活跃维度"，内层 listener 是"对同一说话者复用"的维度。
 	 */
-	private static final ConcurrentHashMap<UUID, ConcurrentHashMap<UUID, CachedResult>> HEARING_CACHE = new ConcurrentHashMap<>();
+	private final ConcurrentHashMap<UUID, ConcurrentHashMap<UUID, CachedResult>> hearingCache = new ConcurrentHashMap<>();
+	private long lastPruneMillis;
 
 	/** 缓存有效期：500ms。为什么是 500ms 见 {@link #resolve} 的注释。 */
 	private static final long CACHE_TTL_MILLIS = 500L;
 
 	/** 一条缓存的判定结果：等级 + 过期时刻（绝对毫秒时间戳）。 */
-	private record CachedResult(HearingLevel mode, long expiresAtMillis) {}
+	private record CachedResult(HearingLevel mode, long expiresAtMillis, Vec3d speakerEye, Vec3d listenerEye,
+			double visibleRange, boolean occlusionCheck) {}
 
 	public HearingLevel resolve(ServerPlayerEntity speaker, ServerPlayerEntity listener) {
 		// 跨维度永远 NONE，且不参与缓存——维度切换是离散的传送事件，不像同维度内位置漂移，
@@ -68,6 +70,10 @@ public class HearingResolver {
 		if (speaker.getWorld() != listener.getWorld()) {
 			return HearingLevel.NONE;
 		}
+		if (speaker.getUuid().equals(listener.getUuid())) return HearingLevel.VISIBLE;
+		double distance = speaker.getPos().distanceTo(listener.getPos());
+		// 距离不能被旧射线缓存短路：同维度传送可能在一个 TTL 内移出听力范围。
+		if (distance > config.hearingRange) return HearingLevel.NONE;
 
 		// S5 短时缓存：同说话者 -> 同听众 500ms 内复用上次的射线判定结果。
 		// 为什么缓存 500ms：太短（如 50ms）缓存命中率几乎为零，等于没缓存；
@@ -76,43 +82,48 @@ public class HearingResolver {
 		// 同时又足以吃下"连续刷屏式发言"这种最需要缓存的高频场景。
 		UUID speakerId = speaker.getUuid();
 		UUID listenerId = listener.getUuid();
-		ConcurrentHashMap<UUID, CachedResult> perSpeaker = HEARING_CACHE.get(speakerId);
+		ConcurrentHashMap<UUID, CachedResult> perSpeaker = hearingCache.get(speakerId);
 		if (perSpeaker != null) {
 			CachedResult cached = perSpeaker.get(listenerId);
 			if (cached != null) {
-				if (System.currentTimeMillis() < cached.expiresAtMillis()) {
+				if (System.currentTimeMillis() < cached.expiresAtMillis()
+						&& cached.speakerEye().equals(speaker.getEyePos())
+						&& cached.listenerEye().equals(listener.getEyePos())
+						&& cached.visibleRange() == config.subtitleVisibleRange
+						&& cached.occlusionCheck() == config.enableOcclusionCheck) {
 					return cached.mode();
 				}
-				// 过期了，惰性移除——不做主动全局扫描，因为 TTL 很短、活跃玩家会被新结果覆盖，
-				// 离线玩家残留条目内存占用可忽略（最多 players^2 条），不值得为此单独起一个清理任务。
+				// 移动或配置变化也会使结果失效；后台 pruneCache 负责回收不再被查询的条目。
 				perSpeaker.remove(listenerId);
 			}
 		}
 
-		double distance = speaker.getPos().distanceTo(listener.getPos());
+		boolean withinVisibleRange = distance <= config.subtitleVisibleRange;
+		// 超出可见距离时无论射线结果如何都只能 AUDIBLE，不必再遍历方块。
+		boolean hasLineOfSight = !withinVisibleRange || !config.enableOcclusionCheck || hasLineOfSight(speaker, listener);
+		HearingLevel result = withinVisibleRange && hasLineOfSight ? HearingLevel.VISIBLE : HearingLevel.AUDIBLE;
 
-		HearingLevel result;
-		if (distance > config.hearingRange) {
-			result = HearingLevel.NONE;
-		} else {
-			boolean withinVisibleRange = distance <= config.subtitleVisibleRange;
-			boolean hasLineOfSight = !config.enableOcclusionCheck || hasLineOfSight(speaker, listener);
-
-			if (withinVisibleRange && hasLineOfSight) {
-				result = HearingLevel.VISIBLE;
-			} else {
-				// 在听力范围内，但要么距离超过可见范围、要么视线被挡 -> 只显示"闻其声不见其人"字幕。
-				result = HearingLevel.AUDIBLE;
-			}
-		}
-
-		writeCache(speakerId, listenerId, result);
+		hearingCache.computeIfAbsent(speakerId, key -> new ConcurrentHashMap<>())
+				.put(listenerId, new CachedResult(result, System.currentTimeMillis() + CACHE_TTL_MILLIS,
+						speaker.getEyePos(), listener.getEyePos(), config.subtitleVisibleRange, config.enableOcclusionCheck));
 		return result;
 	}
 
-	private static void writeCache(UUID speakerId, UUID listenerId, HearingLevel mode) {
-		HEARING_CACHE.computeIfAbsent(speakerId, k -> new ConcurrentHashMap<>())
-				.put(listenerId, new CachedResult(mode, System.currentTimeMillis() + CACHE_TTL_MILLIS));
+	public void pruneCache() {
+		long now = System.currentTimeMillis();
+		if (now - lastPruneMillis < 1000L) return;
+		lastPruneMillis = now;
+		hearingCache.values().forEach(entries -> entries.values().removeIf(entry -> entry.expiresAtMillis() <= now));
+		hearingCache.values().removeIf(java.util.Map::isEmpty);
+	}
+
+	public void removePlayer(UUID id) {
+		hearingCache.remove(id);
+		hearingCache.values().forEach(entries -> entries.remove(id));
+	}
+
+	public void clearCache() {
+		hearingCache.clear();
 	}
 
 	/**

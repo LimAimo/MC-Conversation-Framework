@@ -150,6 +150,7 @@ public final class ClientOnlyModeManager {
 	}
 
 	public static void setOverride(Override newOverride) {
+		net.mccf.mod.client.chat.ClientOnlyChatTranslator.resetSession();
 		override = newOverride == null ? Override.AUTO : newOverride;
 		save();
 		// 模式变更后立即通知服务端，让其更新对该玩家的空间化处理策略。

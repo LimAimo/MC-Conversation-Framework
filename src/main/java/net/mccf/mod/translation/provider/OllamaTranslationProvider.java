@@ -1,7 +1,6 @@
 package net.mccf.mod.translation.provider;
 
 import com.google.gson.JsonObject;
-import com.google.gson.JsonParser;
 import net.mccf.mod.config.ProviderConfig;
 
 import java.util.Map;
@@ -66,10 +65,10 @@ public class OllamaTranslationProvider implements TranslationProvider {
 
 	/** Ollama 模型列表响应：{"models":[{"name":"llama3.2",...}]}。 */
 	private static java.util.List<String> parseTagsResponse(String responseBody) {
-		JsonObject root = JsonParser.parseString(responseBody).getAsJsonObject();
+		JsonObject root = HttpProviderSupport.parseResponseJson(responseBody);
 		com.google.gson.JsonArray models = root.getAsJsonArray("models");
 		if (models == null) {
-			throw new RuntimeException("No models array in Ollama response: " + responseBody);
+			throw new RuntimeException("No models array in Ollama response");
 		}
 		java.util.List<String> names = new java.util.ArrayList<>();
 		for (var element : models) {
@@ -94,10 +93,10 @@ public class OllamaTranslationProvider implements TranslationProvider {
 	}
 
 	private static String parseChatResponse(String responseBody) {
-		JsonObject root = JsonParser.parseString(responseBody).getAsJsonObject();
+		JsonObject root = HttpProviderSupport.parseResponseJson(responseBody);
 		JsonObject message = root.getAsJsonObject("message");
 		if (message == null || !message.has("content")) {
-			throw new RuntimeException("No message.content in Ollama response: " + responseBody);
+			throw new RuntimeException("No message.content in Ollama response");
 		}
 		return message.get("content").getAsString().trim();
 	}

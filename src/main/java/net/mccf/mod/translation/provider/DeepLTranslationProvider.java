@@ -2,15 +2,14 @@ package net.mccf.mod.translation.provider;
 
 import com.google.gson.JsonArray;
 import com.google.gson.JsonObject;
-import com.google.gson.JsonParser;
 import net.mccf.mod.config.ProviderConfig;
 
 import java.util.Map;
+import java.util.Locale;
 import java.util.concurrent.CompletableFuture;
 
 /**
- * DeepL 翻译 Provider——专业机器翻译引擎，不是 LLM，因此不接受上下文/
- * system prompt，只做纯文本翻译。请求格式是表单编码而非 JSON。
+ * DeepL 翻译 Provider。此实现使用表单请求翻译单条原文，不发送 LLM system prompt。
  *
  * Endpoint: 免费版 https://api-free.deepl.com/v2/translate
  *          付费版 https://api.deepl.com/v2/translate
@@ -49,42 +48,50 @@ public class DeepLTranslationProvider implements TranslationProvider {
 			return CompletableFuture.failedFuture(new IllegalStateException("DeepL API key not configured"));
 		}
 
-		String targetLang = toDeepLLanguageCode(request.targetLang());
+		String targetLang = toDeepLTargetLanguageCode(request.targetLang());
 		if (targetLang == null) {
 			return CompletableFuture.failedFuture(
 					new IllegalArgumentException("DeepL does not support target language: " + request.targetLang()));
 		}
 
-		// 若用户没有自定义 endpoint，则按官方约定自动判断 free/pro 端点；
-		// 若用户填写了自定义 endpoint（比如自建反代），直接使用用户填写的值。
-		String endpoint;
-		if (config.endpoint == null || config.endpoint.isBlank()) {
-			endpoint = config.apiKey.trim().endsWith(":fx")
-					? "https://api-free.deepl.com/v2/translate"
-					: "https://api.deepl.com/v2/translate";
-		} else {
-			endpoint = ChatCompletionsSupport.stripTrailingSlash(config.endpoint.trim()) + "/v2/translate";
-		}
+		String endpoint = translationEndpoint();
 
 		StringBuilder form = new StringBuilder();
 		form.append("text=").append(HttpProviderSupport.urlEncode(request.sourceText()));
 		form.append("&target_lang=").append(targetLang);
-		String sourceLang = toDeepLLanguageCode(request.sourceLang());
+		String sourceLang = toDeepLSourceLanguageCode(request.sourceLang());
 		if (sourceLang != null) {
 			form.append("&source_lang=").append(sourceLang);
 		}
 
 		return HttpProviderSupport.postForm(endpoint, form.toString(), Map.of(
-				"Authorization", "DeepL-Auth-Key " + config.apiKey
+				"Authorization", "DeepL-Auth-Key " + config.apiKey.trim()
 		)).thenApply(DeepLTranslationProvider::parseTranslateResponse)
 				.thenApply(TranslationResult::new);
 	}
 
+	String translationEndpoint() {
+		String base = config.endpoint == null ? "" : ChatCompletionsSupport.stripTrailingSlash(config.endpoint.trim());
+		// Older configs stored the Free URL as an explicit default. Both official base URLs
+		// should follow the key type; genuine custom gateways keep their configured address.
+		if (base.isBlank() || base.equals("https://api-free.deepl.com") || base.equals("https://api.deepl.com")) {
+			base = config.apiKey != null && config.apiKey.trim().endsWith(":fx")
+					? "https://api-free.deepl.com" : "https://api.deepl.com";
+		}
+		return base + "/v2/translate";
+	}
+
+	static String toDeepLSourceLanguageCode(String minecraftLocale) {
+		String targetCode = toDeepLTargetLanguageCode(minecraftLocale);
+		if (targetCode == null) return null; // Includes "auto": omit source_lang for detection.
+		return targetCode.split("-", 2)[0];
+	}
+
 	private static String parseTranslateResponse(String responseBody) {
-		JsonObject root = JsonParser.parseString(responseBody).getAsJsonObject();
+		JsonObject root = HttpProviderSupport.parseResponseJson(responseBody);
 		JsonArray translations = root.getAsJsonArray("translations");
 		if (translations == null || translations.isEmpty()) {
-			throw new RuntimeException("No translations in DeepL response: " + responseBody);
+			throw new RuntimeException("No translations in DeepL response");
 		}
 		return translations.get(0).getAsJsonObject().get("text").getAsString().trim();
 	}
@@ -94,19 +101,21 @@ public class DeepLTranslationProvider implements TranslationProvider {
 	 * 只覆盖 DeepL 官方支持的语言列表中的常见项；不支持的语言返回 null，
 	 * 调用方应据此判断是否需要跳过 DeepL、改用 LLM 类 Provider。
 	 */
-	private static String toDeepLLanguageCode(String minecraftLocale) {
+	static String toDeepLTargetLanguageCode(String minecraftLocale) {
 		if (minecraftLocale == null) return null;
-		return switch (minecraftLocale.toLowerCase()) {
-			case "en_us", "en_gb" -> "EN";
-			case "zh_cn" -> "ZH-HANS";
-			case "zh_tw" -> "ZH-HANT";
+		return switch (minecraftLocale.toLowerCase(Locale.ROOT)) {
+			case "en_us" -> "EN-US";
+			case "en_gb" -> "EN-GB";
+			case "zh_cn", "zh_sg" -> "ZH-HANS";
+			case "zh_tw", "zh_hk" -> "ZH-HANT";
 			case "ja_jp" -> "JA";
 			case "ko_kr" -> "KO";
 			case "de_de" -> "DE";
 			case "fr_fr" -> "FR";
 			case "es_es", "es_mx" -> "ES";
 			case "it_it" -> "IT";
-			case "pt_br", "pt_pt" -> "PT";
+			case "pt_br" -> "PT-BR";
+			case "pt_pt" -> "PT-PT";
 			case "ru_ru" -> "RU";
 			case "nl_nl" -> "NL";
 			case "pl_pl" -> "PL";

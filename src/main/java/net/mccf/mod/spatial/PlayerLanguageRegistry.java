@@ -32,4 +32,6 @@ public class PlayerLanguageRegistry {
 	public static void remove(UUID playerId) {
 		LANGUAGES.remove(playerId);
 	}
+
+	public static void clear() { LANGUAGES.clear(); }
 }

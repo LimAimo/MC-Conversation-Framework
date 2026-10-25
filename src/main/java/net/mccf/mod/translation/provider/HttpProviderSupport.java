@@ -1,7 +1,8 @@
 package net.mccf.mod.translation.provider;
 
 import com.google.gson.Gson;
-import net.mccf.mod.MCCF;
+import com.google.gson.JsonObject;
+import com.google.gson.JsonParser;
 
 import java.net.URI;
 import java.net.http.HttpClient;
@@ -9,6 +10,9 @@ import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
 import java.time.Duration;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CompletionException;
+import java.util.concurrent.TimeUnit;
+import java.util.function.Supplier;
 
 /**
  * 各 HTTP 翻译 Provider 共用的请求发送逻辑。
@@ -39,22 +43,16 @@ final class HttpProviderSupport {
 
 	/** 发送一个 GET 请求并返回响应体字符串，用于模型列表这类只读接口。 */
 	static CompletableFuture<String> getJson(String url, java.util.Map<String, String> headers) {
-		HttpRequest.Builder builder = HttpRequest.newBuilder()
-				.uri(URI.create(url))
-				.timeout(REQUEST_TIMEOUT)
-				.GET();
+		return send(() -> {
+			HttpRequest.Builder builder = HttpRequest.newBuilder()
+					.uri(URI.create(url))
+					.timeout(REQUEST_TIMEOUT)
+					.GET();
 
-		headers.forEach(builder::header);
+			headers.forEach(builder::header);
 
-		return CLIENT.sendAsync(builder.build(), HttpResponse.BodyHandlers.ofString())
-				.thenApply(response -> {
-					if (response.statusCode() / 100 != 2) {
-						MCCF.LOGGER.warn("[MCCF] Provider HTTP call to {} failed with status {}: {}",
-								url, response.statusCode(), truncate(response.body()));
-						throw new RuntimeException("HTTP " + response.statusCode() + " from " + url);
-					}
-					return response.body();
-				});
+			return builder.build();
+		});
 	}
 
 	/**
@@ -62,48 +60,60 @@ final class HttpProviderSupport {
 	 * future 以异常方式完成，调用方（TranslationService）会捕获并降级为原文。
 	 */
 	static CompletableFuture<String> postJson(String url, String body, java.util.Map<String, String> headers) {
-		HttpRequest.Builder builder = HttpRequest.newBuilder()
-				.uri(URI.create(url))
-				.timeout(REQUEST_TIMEOUT)
-				.POST(HttpRequest.BodyPublishers.ofString(body));
+		return send(() -> {
+			HttpRequest.Builder builder = HttpRequest.newBuilder()
+					.uri(URI.create(url))
+					.timeout(REQUEST_TIMEOUT)
+					.POST(HttpRequest.BodyPublishers.ofString(body));
 
-		headers.forEach(builder::header);
+			headers.forEach(builder::header);
 
-		return CLIENT.sendAsync(builder.build(), HttpResponse.BodyHandlers.ofString())
-				.thenApply(response -> {
-					if (response.statusCode() / 100 != 2) {
-						MCCF.LOGGER.warn("[MCCF] Provider HTTP call to {} failed with status {}: {}",
-								url, response.statusCode(), truncate(response.body()));
-						throw new RuntimeException("HTTP " + response.statusCode() + " from " + url);
-					}
-					return response.body();
-				});
+			return builder.build();
+		});
 	}
 
 	/** 表单编码版本（DeepL 用表单而不是 JSON body）。 */
 	static CompletableFuture<String> postForm(String url, String formBody, java.util.Map<String, String> headers) {
-		HttpRequest.Builder builder = HttpRequest.newBuilder()
-				.uri(URI.create(url))
-				.timeout(REQUEST_TIMEOUT)
-				.header("Content-Type", "application/x-www-form-urlencoded")
-				.POST(HttpRequest.BodyPublishers.ofString(formBody));
+		return send(() -> {
+			HttpRequest.Builder builder = HttpRequest.newBuilder()
+					.uri(URI.create(url))
+					.timeout(REQUEST_TIMEOUT)
+					.header("Content-Type", "application/x-www-form-urlencoded")
+					.POST(HttpRequest.BodyPublishers.ofString(formBody));
 
-		headers.forEach(builder::header);
+			headers.forEach(builder::header);
 
-		return CLIENT.sendAsync(builder.build(), HttpResponse.BodyHandlers.ofString())
-				.thenApply(response -> {
-					if (response.statusCode() / 100 != 2) {
-						MCCF.LOGGER.warn("[MCCF] Provider HTTP call to {} failed with status {}: {}",
-								url, response.statusCode(), truncate(response.body()));
-						throw new RuntimeException("HTTP " + response.statusCode() + " from " + url);
-					}
-					return response.body();
-				});
+			return builder.build();
+		});
 	}
 
-	private static String truncate(String s) {
-		if (s == null) return "";
-		return s.length() > 300 ? s.substring(0, 300) + "..." : s;
+	private static CompletableFuture<String> send(Supplier<HttpRequest> request) {
+		try {
+			return CLIENT.sendAsync(request.get(), HttpResponse.BodyHandlers.ofString())
+					// 限制整个响应体的完成时间，模型列表请求也不能因上游挂起而永久锁住按钮。
+					.orTimeout(REQUEST_TIMEOUT.toMillis(), TimeUnit.MILLISECONDS)
+					.handle((response, error) -> {
+						// Do not retain URLs, headers, or error bodies: proxies may echo API keys.
+						if (error != null) {
+							throw new CompletionException(new IllegalStateException("Provider network request failed"));
+						}
+						if (response.statusCode() / 100 != 2) {
+							throw new CompletionException(new IllegalStateException("Provider returned HTTP " + response.statusCode()));
+						}
+						return response.body();
+					});
+		} catch (RuntimeException ex) {
+			return CompletableFuture.failedFuture(
+					new IllegalArgumentException("Invalid provider endpoint or request configuration"));
+		}
+	}
+
+	static JsonObject parseResponseJson(String responseBody) {
+		try {
+			return JsonParser.parseString(responseBody).getAsJsonObject();
+		} catch (RuntimeException ex) {
+			throw new IllegalStateException("Provider returned invalid JSON");
+		}
 	}
 
 	/**
