@@ -37,6 +37,13 @@ import java.util.Locale;
 public class LocalConfigPanel extends ProviderConfigPanel {
 
 	private final ClientOnlyTranslationConfig config = ClientOnlyTranslationConfig.get();
+	/** Owned by the parent Screen, so widget recreation cannot discard pending edits. */
+	public static final class DraftState {
+		final ProviderConfigDrafts providers = new ProviderConfigDrafts();
+		ClientOnlyModeManager.Override pendingOverride;
+		long modelsRequest;
+	}
+	private final DraftState draftState;
 
 	private CyclingButtonWidget<ClientOnlyModeManager.Override> modeButton;
 	private TextFieldWidget apiKeyField;
@@ -51,12 +58,11 @@ public class LocalConfigPanel extends ProviderConfigPanel {
 
 	private Text statusMessage = Text.empty();
 	private int statusColor = Colors.YELLOW;
-	private boolean userClearedApiKey = false;
-	/** 暂存的运行模式选择，点保存才落盘，语义同旧版 ClientOnlyConfigScreen。 */
-	private ClientOnlyModeManager.Override pendingOverride = null;
 
-	public LocalConfigPanel(Screen screen, int left, int top, int right, int bottom, int screenCenterY) {
+	public LocalConfigPanel(Screen screen, int left, int top, int right, int bottom, int screenCenterY,
+			DraftState draftState) {
 		super(screen, left, top, right, bottom, screenCenterY);
+		this.draftState = draftState;
 	}
 
 	@Override
@@ -79,13 +85,13 @@ public class LocalConfigPanel extends ProviderConfigPanel {
 		int y = panelTop;
 
 		ClientOnlyModeManager.Override initialMode =
-				pendingOverride != null ? pendingOverride : ClientOnlyModeManager.getOverride();
+				draftState.pendingOverride != null ? draftState.pendingOverride : ClientOnlyModeManager.getOverride();
 		modeButton = own(CyclingButtonWidget.<ClientOnlyModeManager.Override>builder(mode ->
 						Text.translatable("mccf.localconfig.mode." + mode.name().toLowerCase(Locale.ROOT)))
 				.values(List.of(ClientOnlyModeManager.Override.values()))
 				.initially(initialMode)
 				.build(panelLeft, y, panelWidth, fieldHeight,
-						Text.translatable("mccf.localconfig.mode"), (button, value) -> pendingOverride = value));
+						Text.translatable("mccf.localconfig.mode"), (button, value) -> draftState.pendingOverride = value));
 		y += spacing;
 
 		int apiKeyFieldWidth = panelWidth - 44;
@@ -116,7 +122,7 @@ public class LocalConfigPanel extends ProviderConfigPanel {
 
 		// "强制关闭思考"开关：与 ServerConfigPanel 同款逻辑，见其注释。这里的
 		// disableThinking 存在 ClientProviderConfig（纯客户端模式，不经服务端）。
-		ClientProviderConfig initialPc = config.getOrCreate(selectedProvider);
+		ClientProviderConfig initialPc = draft(selectedProvider);
 		disableThinkingButton = own(CyclingButtonWidget.onOffBuilder(initialPc.disableThinking)
 				.build(panelLeft, y, panelWidth, fieldHeight,
 						Text.translatable("mccf.config.disable_thinking"),
@@ -153,13 +159,12 @@ public class LocalConfigPanel extends ProviderConfigPanel {
 
 	@Override
 	protected void onProviderSelected(String providerId) {
-		userClearedApiKey = false;
 		refreshFieldsFromState();
 	}
 
 	private void refreshFieldsFromState() {
 		if (apiKeyField == null) return;
-		ClientProviderConfig pc = config.getOrCreate(selectedProvider);
+		ClientProviderConfig pc = draft(selectedProvider);
 		apiKeyField.setText(pc.apiKey == null ? "" : pc.apiKey);
 		modelField.setText(pc.model == null ? "" : pc.model);
 		endpointField.setText(pc.endpoint == null ? "" : pc.endpoint);
@@ -199,6 +204,21 @@ public class LocalConfigPanel extends ProviderConfigPanel {
 		}
 	}
 
+	private ClientProviderConfig draft(String providerId) {
+		return draftState.providers.get(providerId, config.getOrCreate(providerId));
+	}
+
+	@Override
+	public void captureDraft() {
+		if (apiKeyField == null || selectedProvider == null) return;
+		ClientProviderConfig pc = draft(selectedProvider);
+		pc.apiKey = apiKeyField.getText();
+		if (!pc.apiKey.isBlank()) pc.clearApiKey = false;
+		pc.model = modelField.getText();
+		pc.endpoint = endpointField.getText();
+		pc.isCustomEndpoint = !pc.endpoint.isBlank();
+	}
+
 	private void refreshSyncButtonState() {
 		boolean canSync = ClientPlayNetworking.canSend(RequestConfigPayload.ID)
 				&& ClientConfigState.get().hasReceivedSnapshot;
@@ -224,11 +244,11 @@ public class LocalConfigPanel extends ProviderConfigPanel {
 			return;
 		}
 		config.copyPublicFieldsFrom(ClientConfigState.get());
+		config.providers.forEach(draftState.providers::replace);
 		selectedProvider = config.activeProvider;
 		if (listWidget != null) {
 			listWidget.setSelectedProvider(selectedProvider);
 		}
-		userClearedApiKey = false;
 		refreshFieldsFromState();
 		statusMessage = Text.translatable("mccf.localconfig.sync_done");
 		statusColor = Colors.YELLOW;
@@ -243,8 +263,10 @@ public class LocalConfigPanel extends ProviderConfigPanel {
 	 * 调用 {@link ClientOnlyTranslationConfig#save()} 落盘。
 	 */
 	private void onDisableThinkingToggled(CyclingButtonWidget<Boolean> button, boolean newValue) {
+		captureDraft();
+		String providerId = selectedProvider;
 		if (!newValue) {
-			config.getOrCreate(selectedProvider).disableThinking = false;
+			draft(providerId).disableThinking = false;
 			return;
 		}
 
@@ -254,7 +276,7 @@ public class LocalConfigPanel extends ProviderConfigPanel {
 					// 同款注释——setScreen 触发 init 重建，重建时读 state/config 的值设置按钮
 					// 显示，所以状态更新必须在 setScreen 之前完成，否则按钮显示"关"不刷新。
 					if (confirmed) {
-						config.getOrCreate(selectedProvider).disableThinking = true;
+						draft(providerId).disableThinking = true;
 					}
 					MinecraftClient.getInstance().setScreen(screen);
 				},
@@ -275,18 +297,22 @@ public class LocalConfigPanel extends ProviderConfigPanel {
 	 * 如果输入框为空，沿用已保存的配置（方便"已经保存过，只是想重新拉一次"的场景）。
 	 */
 	private void onFetchModels() {
-		ClientProviderConfig savedPc = config.getOrCreate(selectedProvider);
+		captureDraft();
+		String providerId = selectedProvider;
+		long request = ++draftState.modelsRequest;
+		ClientProviderConfig savedPc = config.getOrCreate(providerId);
 		String apiKey = apiKeyField.getText().isBlank() ? savedPc.apiKey : apiKeyField.getText();
 		String endpoint = endpointField.getText().isBlank() ? savedPc.endpoint : endpointField.getText();
 		String model = modelField.getText().isBlank() ? savedPc.model : modelField.getText();
 
 		ProviderConfig tempConfig = new ProviderConfig(apiKey, model, endpoint);
-		var provider = ProviderFactory.create(selectedProvider, tempConfig);
+		var provider = ProviderFactory.create(providerId, tempConfig);
 
 		statusMessage = Text.translatable("mccf.config.fetching_models");
 		statusColor = Colors.YELLOW;
 
 		provider.listModels().thenAccept(models -> MinecraftClient.getInstance().execute(() -> {
+			if (MinecraftClient.getInstance().currentScreen != screen || request != draftState.modelsRequest) return;
 			if (models.isEmpty()) {
 				statusMessage = Text.translatable("mccf.config.models_empty");
 				statusColor = Colors.YELLOW;
@@ -295,11 +321,20 @@ public class LocalConfigPanel extends ProviderConfigPanel {
 			statusMessage = Text.translatable("mccf.config.models_opened");
 			statusColor = Colors.YELLOW;
 			MinecraftClient.getInstance().setScreen(
-					new ModelSelectionScreen(screen, selectedProvider, models, model, this::setModelFromSelection));
+					new ModelSelectionScreen(screen, providerId, models, model,
+							selectedModel -> {
+								// A resize may have replaced this panel while the API request was pending.
+								if (screen instanceof MCCFConfigScreen parent) {
+									parent.setLocalModelFromSelection(providerId, selectedModel);
+								} else {
+									setModelFromSelection(providerId, selectedModel);
+								}
+							}));
 		})).exceptionally(ex -> {
 			String reason = ex.getCause() != null ? ex.getCause().getMessage() : ex.getMessage();
-			MCCF.LOGGER.warn("[MCCF] Local model list fetch failed for provider {}: {}", selectedProvider, reason);
+			MCCF.LOGGER.warn("[MCCF] Local model list fetch failed for provider {}: {}", providerId, reason);
 			MinecraftClient.getInstance().execute(() -> {
+				if (MinecraftClient.getInstance().currentScreen != screen || request != draftState.modelsRequest) return;
 				statusMessage = Text.translatable("mccf.config.fetch_failed", reason);
 				statusColor = Colors.YELLOW;
 			});
@@ -307,17 +342,18 @@ public class LocalConfigPanel extends ProviderConfigPanel {
 		});
 	}
 
-	/** ModelSelectionScreen 选中模型后的回调：更新输入框 + 写入本地配置（不立即保存）。 */
-	public void setModelFromSelection(String model) {
-		if (modelField != null) {
+	/** Apply a selection to its request's provider draft; saving persists it later. */
+	public void setModelFromSelection(String providerId, String model) {
+		if (providerId.equals(selectedProvider) && modelField != null) {
 			modelField.setText(model);
 		}
-		config.getOrCreate(selectedProvider).model = model;
+		draft(providerId).model = model;
 	}
 
 	private void onClearApiKey() {
 		apiKeyField.setText("");
-		userClearedApiKey = true;
+		draft(selectedProvider).apiKey = "";
+		draft(selectedProvider).clearApiKey = true;
 		statusMessage = Text.translatable("mccf.config.api_key_cleared");
 		statusColor = Colors.YELLOW;
 	}
@@ -336,7 +372,7 @@ public class LocalConfigPanel extends ProviderConfigPanel {
 	 */
 	private void onSave() {
 		ClientOnlyModeManager.Override effectiveOverride =
-				pendingOverride != null ? pendingOverride : ClientOnlyModeManager.getOverride();
+				draftState.pendingOverride != null ? draftState.pendingOverride : ClientOnlyModeManager.getOverride();
 		boolean needsConfirmation = effectiveOverride == ClientOnlyModeManager.Override.FORCE_SERVER_MODE
 				&& !ClientOnlyModeManager.isServerDetected();
 
@@ -374,24 +410,18 @@ public class LocalConfigPanel extends ProviderConfigPanel {
 	 * "设为本地默认"按钮，见类注释）。
 	 */
 	private void performSave() {
-		ClientProviderConfig pc = config.getOrCreate(selectedProvider);
-		String enteredKey = apiKeyField.getText();
-		if (userClearedApiKey) {
-			pc.apiKey = "";
-		} else if (!enteredKey.isBlank()) {
-			pc.apiKey = enteredKey;
-		}
-		userClearedApiKey = false;
-
-		pc.model = modelField.getText();
-		String enteredEndpoint = endpointField.getText();
-		pc.endpoint = enteredEndpoint;
-		pc.isCustomEndpoint = !enteredEndpoint.isBlank();
+		captureDraft();
+		ClientProviderConfig pc = draft(selectedProvider).copy();
+		// Blank input preserves a saved key unless the explicit clear button was used.
+		if (!pc.clearApiKey && pc.apiKey.isBlank()) pc.apiKey = config.getOrCreate(selectedProvider).apiKey;
+		pc.clearApiKey = false;
+		config.providers.put(selectedProvider, pc);
+		draftState.providers.replace(selectedProvider, pc);
 
 		config.activeProvider = selectedProvider;
 
-		if (pendingOverride != null) {
-			ClientOnlyModeManager.setOverride(pendingOverride);
+		if (draftState.pendingOverride != null) {
+			ClientOnlyModeManager.setOverride(draftState.pendingOverride);
 		}
 
 		config.save();

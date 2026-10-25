@@ -69,8 +69,7 @@ public class ClientOnlyTranslationConfig {
 
 	/** 转换成 {@link ProviderFactory} 需要的服务端配置对象，方便直接复用现有 Provider 实现类。 */
 	public ProviderConfig toProviderConfig(String providerId) {
-		ClientProviderConfig pc = getOrCreate(providerId);
-		return new ProviderConfig(pc.apiKey, pc.model, pc.endpoint);
+		return getOrCreate(providerId).toProviderConfig();
 	}
 
 	/**

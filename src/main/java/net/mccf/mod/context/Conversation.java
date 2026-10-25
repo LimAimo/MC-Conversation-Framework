@@ -3,11 +3,13 @@ package net.mccf.mod.context;
 import java.util.ArrayDeque;
 import java.util.Deque;
 import java.util.LinkedHashSet;
+import java.util.List;
 import java.util.Set;
 import java.util.UUID;
 
 /**
- * 一个 Conversation 代表"当前能够互相交流的一组玩家"及其共享的上下文。
+ * 这个类只管一组参与者及其消息记录；空间重算由 ConversationManager 负责，
+ * 每个听众可使用哪些上下文由 SpatialChatHandler 在发送时筛选。
  *
  * 这是"AI 不是全知"原则的核心落地：
  * - AI Provider 在翻译时只能看到某个 Conversation 内部的消息（见
@@ -20,8 +22,8 @@ import java.util.UUID;
  * 生命周期内，所有参与者说过的话都作为翻译上下文，不再做任何条数截断——应用户
  * 明确要求"一个 Conversation 从开始到结束作为完整上下文"。生命周期的终结由
  * ConversationManager 的 idle timeout（默认 120 秒无人发言）控制，超时后整个
- * Conversation 被丢弃，下一次有人发言会新建一个新的对话组。这意味着上下文不会
- * 跨对话组泄露，也不会无限累积——长对话期间确实会让 prompt 变长、token 消耗
+ * Conversation 被丢弃，下一次有人发言会新建一个新的对话组。持续发言会让记录继续
+ * 增长，闲置超时并非绝对容量上限；长对话期间确实会让 prompt 变长、token 消耗
  * 增加，这是用户知情接受的取舍（用户明确选择"完全去掉截断"而非软上限方案）。
  *
  * Conversation 本身不做任何空间判定，只是一个"当前参与者 + 历史消息"的容器；
@@ -71,12 +73,18 @@ public class Conversation {
 	 *
 	 * 0.16.0 起不再做条数截断——整个 Conversation 生命周期内的所有消息都保留作为
 	 * 翻译上下文（应用户明确要求"一个 Conversation 从开始到结束作为完整上下文"）。
-	 * 上下文不会无限增长：ConversationManager 的 idle timeout 会在无人发言一段时间
-	 * 后整体释放 Conversation，下一次发言新建新组。早期版本的 MAX_CONTEXT_MESSAGES=20
+	 * ConversationManager 的 idle timeout 会在无人发言一段时间后整体释放
+	 * Conversation；持续发言时保留完整记录。早期版本的 MAX_CONTEXT_MESSAGES=20
 	 * 硬截断已移除。
 	 */
 	public void recordMessage(UUID speakerId, String text, long currentTick) {
-		recentMessages.addLast(new ContextMessage(speakerId, text, currentTick));
+		recordMessage(speakerId, text, currentTick, participants);
+	}
+
+	public void recordMessage(UUID speakerId, String text, long currentTick, Set<UUID> recipients) {
+		// 后来加入的人不能凭当前位置获得此前未听到的消息，因此冻结实际收件人，
+		// 让对话合并后仍可验证每位听众是否确实接收过这条上下文。
+		recentMessages.addLast(new ContextMessage(speakerId, text, currentTick, Set.copyOf(recipients)));
 		this.lastActivityTick = currentTick;
 	}
 
@@ -84,5 +92,18 @@ public class Conversation {
 		return recentMessages;
 	}
 
-	public record ContextMessage(UUID speakerId, String text, long tick) {}
+	public List<String> contextFor(UUID listenerId, Set<UUID> currentlyPresent) {
+		return contextFor(listenerId, listenerId, currentlyPresent);
+	}
+
+	public List<String> contextFor(UUID speakerId, UUID listenerId, Set<UUID> currentlyPresent) {
+		return recentMessages.stream()
+				.filter(message -> currentlyPresent.contains(message.speakerId()))
+				.filter(message -> message.recipients().contains(speakerId))
+				.filter(message -> message.recipients().contains(listenerId))
+				.map(ContextMessage::text)
+				.toList();
+	}
+
+	public record ContextMessage(UUID speakerId, String text, long tick, Set<UUID> recipients) {}
 }

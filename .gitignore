@@ -61,3 +61,7 @@ run/config/mccf/
 # 决定是否跟踪，这里只排除 memory 子目录。
 .codebuddy/memory/
 .codebuddy/
+
+# Python 辅助脚本的解释器缓存，不属于项目源码。
+__pycache__/
+*.py[cod]

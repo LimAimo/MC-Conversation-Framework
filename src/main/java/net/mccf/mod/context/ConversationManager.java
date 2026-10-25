@@ -1,196 +1,199 @@
 package net.mccf.mod.context;
 
-import net.mccf.mod.MCCF;
 import net.mccf.mod.config.MCCFConfig;
 import net.minecraft.server.MinecraftServer;
 
+import java.util.ArrayDeque;
 import java.util.ArrayList;
+import java.util.Comparator;
 import java.util.HashMap;
+import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.UUID;
-import java.util.concurrent.ConcurrentHashMap;
+import java.util.function.DoubleSupplier;
+import java.util.function.IntSupplier;
 
 /**
- * 管理所有活跃的 {@link Conversation}，负责合并、拆分与过期释放。
+ * 这个类只管对话成员的合并、空间拆分和过期，不发送网络包；名单同步由
+ * SpatialChatHandler 消费变更后完成。所有修改都在服务器主线程执行。
  *
- * 触发规则（对应设计确认）："距离 + 主动发言"：
- * 玩家必须实际说话、且当时与目标接收者处于 conversationRange 范围内，
- * 才会被加入到相应的 Conversation。仅仅"路过"或"站在附近不说话"
- * 不会把人拉进对话组——这避免了"沉默的旁观者被动获得剧透"的情况。
- *
- * 合并示例（对应设计文档）：
- *   A 与 B 聊天 -> 建立 Conversation{A,B}
- *   C 加入聊天 -> 升级为 Conversation{A,B,C}
- *   A 离开范围/长时间不说话 -> 重新计算为 Conversation{B,C}，
- *     A 之前的发言不再参与 B、C 之后对话的翻译上下文。
- *
- * 实现说明：本管理器不主动"踢出"玩家；一个玩家是否仍属于某个 Conversation，
- * 由 SpatialChatHandler 在每次有人说话时重新计算范围内的听众，并调用
- * {@link #recordUtterance} 合并/拆分。真正的"离开"体现在：
- * 该玩家不再出现在任何后续 recordUtterance 的听众集合里，
- * 且其所在 Conversation 会在 tick() 中因超时或范围重算而与之分离。
+ * 对话组按同维度、conversationRange 内的连接关系维持，避免移动后仍永久
+ * 留在旧组。连通组并不表示所有成员互相听见，发送端还必须针对每位听众
+ * 筛选消息的实际收件人与当前空间关系，不能把整组历史直接交给翻译服务。
  */
 public class ConversationManager {
 
-	private final MCCFConfig config;
-
-	/** conversationId -> Conversation */
-	private final Map<UUID, Conversation> conversations = new ConcurrentHashMap<>();
-
-	/** playerId -> 该玩家当前所属的 Conversation id（一个玩家同一时刻只属于一个对话组）。 */
-	private final Map<UUID, UUID> playerToConversation = new ConcurrentHashMap<>();
+	private final IntSupplier timeoutSeconds;
+	private final DoubleSupplier conversationRange;
+	private final Map<UUID, Conversation> conversations = new LinkedHashMap<>();
+	private final Map<UUID, UUID> playerToConversation = new HashMap<>();
+	private final Set<UUID> changedRosters = new LinkedHashSet<>();
 
 	public ConversationManager(MCCFConfig config) {
-		this.config = config;
+		this(() -> config.conversationIdleTimeoutSeconds, () -> config.conversationRange);
 	}
 
-	/**
-	 * recordUtterance 的返回结果：处理后的 Conversation + 这次调用真正新增的
-	 * 参与者集合（可能为空——如果 speaker 和 audience 里的人此前就已经全部
-	 * 在这个 Conversation 里，比如同一批人持续对话中）。
-	 *
-	 * newlyJoined 存在的意义：调用方（SpatialChatHandler）需要判断"这次是否
-	 * 有新人加入了这个 Conversation"，只有真的有变化时才广播
-	 * {@code ConversationRosterPayload} 给客户端更新聊天历史记录里的对话
-	 * 成员名单，避免每次发言都无条件广播（浪费带宽，应用户明确要求只在
-	 * 真正变化时才发）。
-	 */
+	// 参数源保留 /reload 原地更新的语义，也让空间规则能脱离游戏实例回归测试。
+	ConversationManager(IntSupplier timeoutSeconds, DoubleSupplier conversationRange) {
+		this.timeoutSeconds = timeoutSeconds;
+		this.conversationRange = conversationRange;
+	}
+
 	public record UtteranceResult(Conversation conversation, Set<UUID> newlyJoined) {}
 
-	/**
-	 * 记录一次"发言事件"：speaker 对 audience（当前范围内能听到的玩家集合）说了一句话。
-	 * 这是驱动 Conversation 合并/拆分的唯一入口。
-	 *
-	 * 逻辑：
-	 * 1. 收集 speaker 自己 + audience 中所有已经"在场"的玩家已归属的 Conversation。
-	 * 2. 如果都不属于任何 Conversation -> 新建一个，成员为 speaker + audience。
-	 * 3. 如果部分人已属于某个 Conversation -> 合并所有涉及到的 Conversation 为一个，
-	 *    成员为其并集（原则：新人主动说话且在范围内，即并入现有对话组）。
-	 * 4. 不在 audience 范围内、但仍属于旧 Conversation 的玩家不受影响——
-	 *    他们是否掉线/离开该组，交由后续的距离重算或超时机制处理。
-	 *
-	 * @return 处理后的 Conversation + 这次真正新增的参与者集合，见 {@link UtteranceResult}
-	 */
+	/** 这里只存空间值，不持有实体，避免分组规则依赖实体生命周期。 */
+	public record Location(Object dimension, double x, double y, double z) {
+		public boolean within(Location other, double range) {
+			if (other == null || !dimension.equals(other.dimension)) return false;
+			double dx = x - other.x, dy = y - other.y, dz = z - other.z;
+			return dx * dx + dy * dy + dz * dz <= range * range;
+		}
+	}
+
+	public static Map<UUID, Location> snapshotLocations(MinecraftServer server) {
+		Map<UUID, Location> positions = new LinkedHashMap<>();
+		for (var player : server.getPlayerManager().getPlayerList()) {
+			positions.put(player.getUuid(), new Location(player.getWorld().getRegistryKey(),
+					player.getX(), player.getY(), player.getZ()));
+		}
+		return positions;
+	}
+
 	public UtteranceResult recordUtterance(UUID speakerId, Set<UUID> audience, long currentTick) {
-		List<Conversation> involved = new ArrayList<>();
-		collectConversation(speakerId, involved);
+		Set<UUID> involvedIds = new LinkedHashSet<>();
+		UUID own = playerToConversation.get(speakerId);
+		if (own != null) involvedIds.add(own);
 		for (UUID listenerId : audience) {
-			collectConversation(listenerId, involved);
+			UUID id = playerToConversation.get(listenerId);
+			if (id != null) involvedIds.add(id);
 		}
-
-		Conversation target;
-		if (involved.isEmpty()) {
-			target = new Conversation(UUID.randomUUID(), currentTick);
-			conversations.put(target.getId(), target);
-		} else {
-			// 合并：保留第一个作为目标，其余的成员并入目标后废弃。
-			target = involved.get(0);
-			for (int i = 1; i < involved.size(); i++) {
-				Conversation other = involved.get(i);
-				if (other.getId().equals(target.getId())) continue;
-				mergeInto(target, other, currentTick);
-			}
+		Conversation target = involvedIds.isEmpty()
+				? new Conversation(UUID.randomUUID(), currentTick)
+				: conversations.get(involvedIds.iterator().next());
+		conversations.put(target.getId(), target);
+		Set<UUID> before = new LinkedHashSet<>(target.getParticipants());
+		boolean merged = false;
+		for (UUID id : involvedIds) {
+			if (id.equals(target.getId())) continue;
+			Conversation source = conversations.remove(id);
+			changedRosters.remove(id);
+			if (source == null) continue;
+			merged = true;
+			target.getParticipants().addAll(source.getParticipants());
+			target.getRecentMessages().addAll(source.getRecentMessages());
 		}
-
-		// 收集这次调用真正新增的参与者——Set.add() 的返回值本身就是"是否真的
-		// 插入了新元素"的权威判断，不需要额外维护"调用前的快照"再做比较。
-		// mergeInto 内部合并旧 Conversation 成员时产生的新增不计入这里
-		// （那些人本来就已经在各自的旧 Conversation 里，只是被合并到 target，
-		// 对他们自己而言"参与者名单"没有变化，只有真正是这次 speaker/audience
-		// 里、此前完全不在任何相关 Conversation 里的人才算"新加入"）。
-		Set<UUID> newlyJoined = new java.util.LinkedHashSet<>();
-		if (target.addParticipant(speakerId)) {
-			newlyJoined.add(speakerId);
+		target.addParticipant(speakerId);
+		target.getParticipants().addAll(audience);
+		for (UUID id : target.getParticipants()) playerToConversation.put(id, target.getId());
+		Set<UUID> joined = new LinkedHashSet<>(target.getParticipants());
+		joined.removeAll(before);
+		if (!joined.isEmpty()) changedRosters.add(target.getId());
+		// 两组历史可能交错产生，按 tick 稳定排序才能保留真实的上下文顺序。
+		if (merged) {
+			List<Conversation.ContextMessage> ordered = new ArrayList<>(target.getRecentMessages());
+			ordered.sort(Comparator.comparingLong(Conversation.ContextMessage::tick));
+			target.getRecentMessages().clear();
+			target.getRecentMessages().addAll(ordered);
 		}
-		playerToConversation.put(speakerId, target.getId());
-		for (UUID listenerId : audience) {
-			if (target.addParticipant(listenerId)) {
-				newlyJoined.add(listenerId);
-			}
-			playerToConversation.put(listenerId, target.getId());
-		}
-
-		return new UtteranceResult(target, newlyJoined);
+		return new UtteranceResult(target, Set.copyOf(joined));
 	}
 
-	private void collectConversation(UUID playerId, List<Conversation> out) {
-		UUID convId = playerToConversation.get(playerId);
-		if (convId == null) return;
-		Conversation conv = conversations.get(convId);
-		if (conv != null && !out.contains(conv)) {
-			out.add(conv);
-		}
-	}
-
-	private void mergeInto(Conversation target, Conversation source, long currentTick) {
-		for (UUID p : source.getParticipants()) {
-			target.addParticipant(p);
-			playerToConversation.put(p, target.getId());
-		}
-		// 合并近期消息，仅保留仍在目标组内的发言者的消息，遵循"离开者的历史不延续"原则。
-		for (Conversation.ContextMessage msg : source.getRecentMessages()) {
-			if (target.getParticipants().contains(msg.speakerId())) {
-				target.recordMessage(msg.speakerId(), msg.text(), msg.tick());
+	public void reconcileParticipants(Map<UUID, Location> positions) {
+		for (Conversation original : new ArrayList<>(conversations.values())) {
+			Set<UUID> remaining = new LinkedHashSet<>(original.getParticipants());
+			remaining.retainAll(positions.keySet());
+			List<Set<UUID>> components = new ArrayList<>();
+			while (!remaining.isEmpty()) {
+				UUID first = remaining.iterator().next();
+				remaining.remove(first);
+				Set<UUID> component = new LinkedHashSet<>();
+				ArrayDeque<UUID> pending = new ArrayDeque<>();
+				pending.add(first);
+				while (!pending.isEmpty()) {
+					UUID next = pending.removeFirst();
+					component.add(next);
+					for (UUID candidate : new ArrayList<>(remaining)) {
+						if (positions.get(next).within(positions.get(candidate), conversationRange.getAsDouble())) {
+							remaining.remove(candidate);
+							pending.addLast(candidate);
+						}
+					}
+				}
+				components.add(component);
+			}
+			if (components.size() == 1 && components.getFirst().equals(original.getParticipants())) continue;
+			conversations.remove(original.getId());
+			changedRosters.remove(original.getId());
+			for (UUID id : original.getParticipants()) playerToConversation.remove(id);
+			for (int i = 0; i < components.size(); i++) {
+				Set<UUID> members = components.get(i);
+				Conversation split = new Conversation(i == 0 ? original.getId() : UUID.randomUUID(),
+						original.getLastActivityTick());
+				split.getParticipants().addAll(members);
+				for (Conversation.ContextMessage message : original.getRecentMessages()) {
+					if (members.contains(message.speakerId())) split.getRecentMessages().addLast(message);
+				}
+				conversations.put(split.getId(), split);
+				for (UUID id : members) playerToConversation.put(id, split.getId());
+				changedRosters.add(split.getId());
 			}
 		}
-		conversations.remove(source.getId());
 	}
 
-	/**
-	 * 显式将某玩家从其当前 Conversation 中移除（例如：SpatialChatHandler 检测到
-	 * 该玩家已不在任何在场成员的听力范围内，或玩家已下线）。
-	 * 对应设计文档中 "A 离开 -> 重新建立 Conversation B-C，A 的内容不再参与后续翻译"。
-	 */
 	public void removeParticipant(UUID playerId) {
-		UUID convId = playerToConversation.remove(playerId);
-		if (convId == null) return;
-		Conversation conv = conversations.get(convId);
-		if (conv == null) return;
-		conv.removeParticipant(playerId);
-		if (conv.isEmpty()) {
-			conversations.remove(convId);
+		UUID id = playerToConversation.remove(playerId);
+		Conversation conversation = conversations.get(id);
+		if (conversation == null) return;
+		conversation.removeParticipant(playerId);
+		if (conversation.isEmpty()) {
+			conversations.remove(id);
+			changedRosters.remove(id);
+		} else {
+			changedRosters.add(id);
 		}
 	}
 
 	public Conversation getConversationFor(UUID playerId) {
-		UUID convId = playerToConversation.get(playerId);
-		return convId == null ? null : conversations.get(convId);
+		return conversations.get(playerToConversation.get(playerId));
 	}
 
-	/**
-	 * 每 tick 调用：释放长时间无人发言的 Conversation（原则 6：Context 生命周期）。
-	 * 避免 AI 引用很久以前的内容、记住不该知道的信息、以及长期上下文堆积导致的性能问题。
-	 */
+	public List<Conversation> consumeRosterChanges() {
+		List<Conversation> changed = new ArrayList<>();
+		for (UUID id : changedRosters) {
+			Conversation conversation = conversations.get(id);
+			if (conversation != null) changed.add(conversation);
+		}
+		changedRosters.clear();
+		return changed;
+	}
+
+	public List<Conversation> snapshotConversations() { return List.copyOf(conversations.values()); }
+
 	public void tick(MinecraftServer server) {
-		long currentTick = server.getTicks();
-		long timeoutTicks = config.conversationIdleTimeoutSeconds * 20L;
+		// 发言前还会立即重算；后台每秒处理沉默期间的移动，避免每 tick
+		// 对静止的大组重复进行平方级距离计算。
+		if (server.getTicks() % 20 == 0) reconcileParticipants(snapshotLocations(server));
+		expire(server.getTicks());
+	}
 
-		List<UUID> expired = new ArrayList<>();
-		for (Conversation conv : conversations.values()) {
-			if (currentTick - conv.getLastActivityTick() > timeoutTicks) {
-				expired.add(conv.getId());
-			}
-		}
-
-		for (UUID convId : expired) {
-			Conversation conv = conversations.remove(convId);
-			if (conv == null) continue;
-			for (UUID p : conv.getParticipants()) {
-				playerToConversation.remove(p, convId);
-			}
-			MCCF.LOGGER.debug("[MCCF] Conversation {} expired after {} idle seconds.",
-					convId, config.conversationIdleTimeoutSeconds);
+	void expire(long currentTick) {
+		for (Conversation conversation : new ArrayList<>(conversations.values())) {
+			if (currentTick - conversation.getLastActivityTick() <= timeoutSeconds.getAsInt() * 20L) continue;
+			conversations.remove(conversation.getId());
+			changedRosters.remove(conversation.getId());
+			for (UUID id : conversation.getParticipants()) playerToConversation.remove(id);
 		}
 	}
 
-	/** 供调试命令使用：当前活跃对话组数量。 */
-	public int getActiveConversationCount() {
-		return conversations.size();
+	public void clear() {
+		conversations.clear();
+		playerToConversation.clear();
+		changedRosters.clear();
 	}
 
-	Map<UUID, Conversation> debugSnapshot() {
-		return new HashMap<>(conversations);
-	}
+	public int getActiveConversationCount() { return conversations.size(); }
+	Map<UUID, Conversation> debugSnapshot() { return new HashMap<>(conversations); }
 }

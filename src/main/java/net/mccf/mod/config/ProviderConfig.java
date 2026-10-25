@@ -1,7 +1,7 @@
 package net.mccf.mod.config;
 
 /**
- * 单个翻译 Provider 的配置项：API Key、模型名、API 基础地址（endpoint）。
+ * 只管保存单个 Provider 的配置值；协议参数与能力适配由对应 TranslationProvider 实现负责。
  *
  * endpoint 字段对所有 Provider（除 Mock 外）都有意义，不再是 Ollama 专属：
  * 每个 Provider 都有一个默认官方地址（见 {@link ProviderDefaults}），
@@ -33,9 +33,8 @@ public class ProviderConfig {
 	 *
 	 * 只对确认支持这个能力的 Provider 生效：DeepSeek、Kimi、Claude、Gemini、
 	 * 智谱（Zhipu）——具体每家用什么参数关闭、参数是否对所有模型代次都有效，
-	 * 见各自 TranslationProvider 实现类的注释。DeepL、Ollama、Mock 这几个
-	 * Provider 没有"思考"概念，这个字段对它们没有意义（配置界面也不会展示
-	 * 这个开关）。
+	 * 见各自 TranslationProvider 实现类的注释。DeepL/Mock 不提供此开关；
+	 * Ollama 本身支持 think，但本项目尚未为它接入此开关，所以界面不展示。
 	 */
 	public boolean disableThinking = false;
 

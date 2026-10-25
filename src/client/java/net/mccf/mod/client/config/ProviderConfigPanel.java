@@ -178,9 +178,13 @@ public abstract class ProviderConfigPanel {
 
 	private void selectProvider(String providerId) {
 		if (providerId.equals(selectedProvider)) return;
+		captureDraft();
 		selectedProvider = providerId;
 		onProviderSelected(providerId);
 	}
+
+	/** Preserve form values before provider switches, tab changes and Screen.init rebuilds. */
+	public abstract void captureDraft();
 
 	/**
 	 * 切换标签页可见性。同时设置 visible（控制渲染 + 官方输入路由的第一道防线）
@@ -189,6 +193,7 @@ public abstract class ProviderConfigPanel {
 	 * 不会误触）。两道防线保证切到未显示的标签页时那些控件绝对不可交互。
 	 */
 	public void setVisible(boolean visible) {
+		captureDraft();
 		this.tabVisible = visible;
 		if (listWidget != null) {
 			listWidget.visible = visible;

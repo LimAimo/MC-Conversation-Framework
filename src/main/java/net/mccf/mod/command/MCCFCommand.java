@@ -147,6 +147,7 @@ public class MCCFCommand {
 		// 委托给 MCCF.reload() 完成完整的读盘 + 重建 Provider + 清缓存流程。
 		// 之前只调 clearCache() 等于没 reload——管理员改了 JSON 文件不会生效。
 		MCCF.reload();
+		ConfigSyncHandler.broadcastSnapshot(ctx.getSource().getServer(), MCCF.getConfig());
 		ctx.getSource().sendFeedback(() -> Text.translatable("command.mccf.reload"), true);
 		return 1;
 	}

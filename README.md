@@ -20,12 +20,12 @@
   离得远看不到人只能听到的就显示在物品栏上方，跟真实说话的感觉一致，不会出现
   "全服都看到你在哪个角落嘀咕"的尴尬。
 - **翻译服务你自己选，自己的 Key 自己填**：支持接入 OpenAI、Claude、Gemini、DeepL、
-  Kimi、DeepSeek，也支持完全本地免费跑的 Ollama——服主可以在游戏内一个设置界面里
+  Kimi、DeepSeek、智谱 AI，也支持本地运行的 Ollama——服主可以在游戏内一个设置界面里
   切换和管理，不需要碰配置文件、不需要重启服务器。
 - **不想让服务器统一管翻译？** 也可以只装客户端、自己配置翻译服务，不依赖服主
   是否安装了这个模组（详见下方"纯客户端模式"）。
 - **错过的对话可以回看**：字幕会自动消失，但游戏里有一个"聊天历史记录"界面，
-  能翻看这局游戏里发生过的所有对话，还会自动按"这是一段对话"分组显示，方便回顾。
+  能翻看保存的最近 500 条聊天记录，还会自动按"这是一段对话"分组显示，方便回顾。
 
 ## 怎么使用？
 
@@ -54,8 +54,8 @@
 
 面向 Minecraft 多人服务器的沉浸式跨语言交流基础设施。核心链路：
 文字聊天拦截 → 空间化听觉判定（距离 + 射线遮挡）→ 动态对话上下文（Conversation，
-一个对话组从开始到结束作为完整翻译上下文）→ 可插拔翻译 Provider（OpenAI/Claude/
-Gemini/DeepL/Kimi/DeepSeek/Ollama）→ 空间化分发（近处走聊天栏 / 远处走物品栏上方
+保留对话生命周期内的记录，翻译时只使用双方实际接收过且仍在可听范围的上下文）→ 可插拔翻译 Provider（OpenAI/Claude/
+Gemini/DeepL/Kimi/DeepSeek/智谱 AI/Ollama）→ 空间化分发（近处走聊天栏 / 远处走物品栏上方
 字幕）→ 游戏内配置界面（ModMenu 集成 + 按键呼出）。
 
 目标版本：**Minecraft 1.21.1 · Yarn Mappings 1.21.1+build.3 · Fabric Loader 0.15.11 ·
@@ -72,22 +72,18 @@ Fabric API 0.116.15+1.21.1 · Fabric Loom 1.7.3 · Gradle 8.8 · Java 21**
 
 ### 1. 前置要求
 - **JDK 21**（推荐 Temurin/Adoptium 或 Microsoft Build of OpenJDK）
-- **Gradle 8.8**（本项目用的 Fabric Loom 1.7.3 实测要求 Gradle ≥ 8.6，
-  用 8.8 是经过验证的稳定版本；wrapper 已锁定 8.8，正常情况下不需要
-  你本机单独装 Gradle，见下）
+- **Gradle 8.8**（与当前 Fabric Loom 1.7.3 配套；仓库只保存 Wrapper 配置，
+  首次需要使用已安装或解压后的 Gradle，见下）
 - 稳定的网络连接（首次构建需要从 Fabric/Maven/Mojang 仓库下载依赖，几百 MB）
 
 ### 2. 关于 Gradle Wrapper
-本项目**没有附带** `gradlew` / `gradlew.bat` / `gradle-wrapper.jar` ——
-这几个文件里的 `gradle-wrapper.jar` 是二进制文件，我在无网络的沙盒环境里
-无法可靠生成一份真实可用的（伪造内容可能导致你本地校验失败或下载损坏的
-Gradle）。`gradle/wrapper/gradle-wrapper.properties` 已经配置好指向
-Gradle 8.8，你只需要在本地生成对应的 wrapper 脚本：
+本项目当前**没有附带** `gradlew` / `gradlew.bat` / `gradle-wrapper.jar`。
+`gradle/wrapper/gradle-wrapper.properties` 已配置为 Gradle 8.8；
+可直接使用 Gradle 8.8 构建，也可先生成 Wrapper：
 
 ```bash
-# 前提：本机已安装任意版本的 Gradle（哪怕版本不同也没关系，wrapper 任务
-# 只是根据已有的 gradle-wrapper.properties 生成 gradlew/gradlew.bat）
-gradle wrapper
+# 使用 Gradle 8.8，避免在加载本项目插件时遇到其他版本的兼容问题
+gradle wrapper --gradle-version 8.8
 
 # 之后就可以用 ./gradlew 了，它会自动下载并使用 8.8
 ./gradlew build
@@ -113,7 +109,19 @@ gradle build          # 或 ./gradlew build（如果已生成 wrapper）
 [ModMenu](https://modrinth.com/mod/modmenu) 11.0.4（1.21.1 对应版本）的话还能获得
 游戏内配置界面的图标入口，非必需。
 
-### 4. IDE 推荐
+### 4. 自动化验证与手动测试
+
+使用 JDK 21 运行 `gradle test` 和 `gradle build`（生成 wrapper 后也可使用对应 wrapper 命令）。
+回归测试覆盖对话分组与上下文可见性、异步消息顺序、翻译缓存失效、DeepL/Kimi 请求格式、
+配置与本地会话状态等；Provider 请求测试使用本地 HTTP 服务，不需要真实 API Key。
+
+构建成功后，可将 `build/libs/MCConversationFramework-1.2.0.jar` 放进 Minecraft 1.21.1
+的测试实例手动体验；`-sources.jar` 用于源码查看，不能作为模组安装。
+本次已使用 **Java 21 + Gradle 8.8** 完成 `build`，**61 项自动化测试全部通过**。
+本次修改**尚未进行游戏内实机验证或真实付费 Provider 集成验证**。
+建议在独立实例测试多人移动/跨维度、遮挡、强制本地翻译、保存配置及聊天历史等路径。
+
+### 5. IDE 推荐
 用 IntelliJ IDEA 打开项目根目录，Gradle 插件会自动识别。首次导入较慢（下载
 Minecraft 反混淆源码 + 依赖），耐心等待即可。跑 `genSources` 后能看到带注释的
 Minecraft 源码，便于后续开发调试。
@@ -124,10 +132,11 @@ Minecraft 源码，便于后续开发调试。
 
 - ✅ 拦截原版聊天，替换为空间化点对点分发
 - ✅ 距离 + 射线遮挡判定"谁能听到/看到"（`HearingResolver`）
-- ✅ 动态 Conversation 合并/拆分/超时释放（`ConversationManager`）
-- ✅ 可插拔翻译 Provider 架构，内置 **7 个真实 Provider** + Mock：
+- ✅ 动态 Conversation 合并、移动/跨维度拆分与闲置超时释放（`ConversationManager`）
+- ✅ 上下文按实际收件人及当前可听关系筛选；新加入者不会获得此前未接收的发言，名单也按听众可见范围发送
+- ✅ 可插拔翻译 Provider 架构，内置 **8 个真实 Provider** + Mock：
   OpenAI、Claude (Anthropic)、Gemini、DeepL、Kimi (Moonshot AI)、
-  DeepSeek、Ollama（本地）
+  DeepSeek、智谱 AI（Zhipu）、Ollama（本地）
 - ✅ **游戏内配置界面**：ModMenu 集成 + 独立按键呼出，可视化切换 Provider、
   填写 API Key / 模型名 / API Endpoint，仅 op 可编辑，普通玩家只读查看
 - ✅ 世界词典（专有名词占位替换，保证跨 Provider 翻译一致性）
@@ -139,7 +148,7 @@ Minecraft 源码，便于后续开发调试。
 - ✅ 配置界面一键导出日志（`logs/latest.log` 中 MCCF 相关行 + 完整日志）
 - ✅ 配置界面多语言（`Text.translatable()`，跟随客户端语言，已提供简体中文翻译）
 - ✅ **纯客户端模式**：服务器没装 MCCF 时自动降级为"仅本地翻译聊天栏文字"
-  （无空间判定、无字幕），也可手动强制切换，详见"三之二、纯客户端模式"
+  （无服务端空间判定、无字幕）；MCCF 服务器上也可选择本地翻译，但继续服从服务器的空间传播规则，详见“三之二、纯客户端模式”
 - ⏳ 语音识别（STT）—— 本版本以文字聊天为输入，语音识别是下一步扩展方向
   （建议对接 Simple Voice Chat 的音频 API 作为输入源，替换 SpatialChatHandler
   的触发源即可，其余流程不需要改动）
@@ -161,16 +170,18 @@ Minecraft 源码，便于后续开发调试。
 API Key。
 
 **每个 Provider 需要填什么**：
-- OpenAI / Claude / Gemini / Kimi / DeepSeek：填 API Key + 模型名（有默认值，
+- OpenAI / Claude / Gemini / Kimi / DeepSeek / 智谱 AI：填 API Key + 模型名（有默认值，
   通常不用改）+ 可选的自定义 API Endpoint（默认走各家官方地址）
-- DeepL：只需要 API Key（免费版 Key 以 `:fx` 结尾，界面会自动识别走免费端点）
+- DeepL：只需要 API Key；官方地址按 Key 类型自动选择 Free/Pro（免费版 Key 以 `:fx` 结尾），也支持自定义网关
 - Ollama：不需要 API Key（本地部署默认无鉴权），需要填 Endpoint（默认
   `http://localhost:11434`）和模型名（默认 `llama3.2`，换成你本地已拉取的模型名）
 - Mock：调试用，无需任何配置
 
+Kimi 的当前兼容默认模型为 `kimi-k2.6`；旧默认 `kimi-k2.5` 已停用。可在模型列表中选择其他可用模型，思考开关受具体模型能力限制。
+
 **一键获取模型**：点"获取模型"按钮会调用对应 Provider 的模型列表接口
-（OpenAI/Kimi/DeepSeek/Claude 用 `GET /v1/models`，Gemini 用
-`GET /v1beta/models`，Ollama 用 `GET /api/tags`），结果打印到聊天栏方便复制。
+（OpenAI/Kimi/Claude 用 `GET /v1/models`，DeepSeek 用 `GET /models`，智谱 AI 用其基础地址下的 `/models`，Gemini 用
+`GET /v1beta/models`，Ollama 用 `GET /api/tags`），结果显示在模型选择界面。
 DeepL（固定引擎无模型概念）和 Mock 不支持，按钮自动置灰。可以用输入框里
 **尚未保存**的 Key 直接测试，不需要先保存一次。
 
@@ -181,7 +192,7 @@ DeepL（固定引擎无模型概念）和 Mock 不支持，按钮自动置灰。
 
 ---
 
-## 三之二、纯客户端模式（服务器没装 MCCF 时）
+## 三之二、纯客户端模式（本地翻译）
 
 如果你连的服务器没有安装 MCCF（比如公共服/别人的服），模组没法拦截聊天做
 空间判定、也没法做距离/遮挡这类需要服务端参与的判定——所有人还是会照常
@@ -193,6 +204,9 @@ DeepL（固定引擎无模型概念）和 Mock 不支持，按钮自动置灰。
 <Steve> こんにちは
 ⇄ Hello
 ```
+
+如果服务器安装了 MCCF，选择纯客户端模式只改变翻译的执行位置和所用 Key：服务器仍按距离/遮挡决定消息能传播给谁，
+不会因某个玩家选择本地翻译而放行全服广播。客户端只翻译服务器实际送达的原文。
 
 **怎么进入这个模式**：
 - **自动检测**（默认）：进入服务器时会检测对方是否声明了 MCCF 的网络通道，
@@ -213,17 +227,14 @@ Endpoint）。如果当前连的服务器恰好装了 MCCF，还可以点"从服
 你自己填。
 
 **已知限制**：
-- 没有对"是否已经是目标语言"做检测，每条消息都会真的发一次翻译请求
-  （Mock Provider 除外，它本身会在同语言时直接透传，不消耗额度）。
-- 不会给自己发的消息做二次翻译（服务器回显自己说的话时会跳过），但其他
-  语言相同的消息目前没有去重/节流，人多的服务器可能会比较费 API 额度。
-- 由于没有服务端参与，这只是"翻译 + 展示美化"，**不是**真正的信息隔离——
-  所有人依然会收到原版广播的完整聊天，纯客户端模式改变的只是你自己客户端
-  怎么显示它。
+- 不检测消息是否已经属于目标语言；自己发的消息跳过翻译，其他消息可能仍产生 API 调用。
+- 本地翻译有每秒最多 5 条的滑动窗口限流，超出的消息不翻译；未提供重复消息缓存。
+- 服务器未装 MCCF 时，客户端只能处理服务器原本广播给它的消息，无法自行增加空间隔离。
+- 服务器装了 MCCF 时，本地翻译模式仍服从服务端空间规则；本地设置不能扩大消息接收范围。
 
 ---
 
-## 四、如何接入其他翻译 Provider（内置 7 个之外的）
+## 四、如何接入其他翻译 Provider（内置 8 个之外的）
 
 打开 `net.mccf.mod.translation.provider.TranslationProvider` 接口，参照
 `MockTranslationProvider` 写一个新的实现类，例如：
@@ -278,6 +289,7 @@ src/main/java/net/mccf/mod/
 │       ├── DeepLTranslationProvider.java
 │       ├── KimiTranslationProvider.java
 │       ├── DeepSeekTranslationProvider.java
+│       ├── ZhipuTranslationProvider.java
 │       └── OllamaTranslationProvider.java
 ├── spatial/
 │   ├── HearingResolver.java          距离 + 射线遮挡判定
@@ -331,10 +343,12 @@ src/client/java/net/mccf/mod/client/
   "conversationIdleTimeoutSeconds": 120,
   "enableOcclusionCheck": true,
   "activeProvider": "mock",
-  "showOriginalText": true,
-  "showOriginalTextInChat": false
+  "providers": {}
 }
 ```
+
+上例省略了 `providers` 的具体条目；加载时会补齐内置 Provider。每项可包含 `apiKey`、`model`、`endpoint`、`disableThinking`，默认官方端点以空值保留自动选择语义。
+“显示原文”等个人偏好保存在 `client-only-config.json`，不再属于服务端配置。
 
 `config/mccf/dictionary.json`：世界词典，格式为
 `{ "词条": { "语言代码": "该语言下的译文", ... }, ... }`，也可以用
@@ -344,30 +358,32 @@ src/client/java/net/mccf/mod/client/
 
 ## 七、已知限制 / 后续可扩展方向
 
-- 语音识别未实现（见"二、当前功能范围"）。
-- `HearingResolver` 目前只做"说话者→听众"单向射线检测一次，性能上对大量玩家
-  同时说话的场景（比如几十人的活动服）没有做批量优化，如果后续遇到性能问题，
-  可以考虑给听众按区块分桶、或限制每 tick 处理的聊天消息数。
-- 字幕的显示时长按文本长度粗略估算，可以后续做成可配置项。
-- Conversation 的合并策略目前是"简单并集"，没有处理"两个大对话组因为一个
-  中间人同时能听到而被强行合并"这种边界情况的精细化处理（比如设置合并的
-  最小重叠人数阈值），如果实测中出现不合理的合并，可以在
-  `ConversationManager.recordUtterance` 里加更细的判定逻辑。
-- 世界广播、NPC 对话、剧情事件等在设计文档中提到的"未来扩展"尚未实现，
-  但整体架构（Provider 可插拔 + Conversation 上下文隔离）是为它们预留的。
-- ~~`network/` 包里有两个未注册使用的死代码类~~（1.0.0 已删除清理，见"五、目录结构"末尾说明）。
-- **纯客户端模式（`ClientOnlyChatTranslator`）用到的 `ClientReceiveMessageEvents.CHAT`
-  事件签名**：此前 README 里标注为"凭印象写、未本地编译验证"的风险点，在
-  1.21.1 上经本地编译验证**签名正确**（5 参数：`message, signedMessage, sender, params, receptionTimestamp`），
-  该风险点已消除。`CyclingButtonWidget.setValue(...)`（在"从服务器同步"按钮里
-  用来刷新下拉框显示）此前同样标注为"凭印象写"，也已在 1.21.1 上编译通过，
-  运行时行为正常。
+- 语音识别、世界广播、NPC 对话和剧情事件尚未实现。
+- 持续活跃的对话保留完整记录，没有固定条数/令牌上限。可见性筛选不会限制持续增长，长对话可能增加内存与 API 成本，或超过模型上下文窗口；闲置超时会释放对话。
+- 对话组按同维度、对话距离内的连通关系维护；同组不代表所有人互相听见。翻译上下文与名单仍按实际收件人和当前可听关系筛选。
+- 空间判定与分组重算在大量玩家场景仍有性能成本，需要游戏内负载测试；当前没有给出性能保证。
+- 字幕显示时长按文本长度估算，历史记录最多保留 500 条聊天及 500 条系统事件。
+- 本地翻译模式不提供服务端 Conversation 的完整上下文；真实翻译质量与延迟仍需用所选 Provider 实测。
+- 本次修复尚未完成 Minecraft 客户端、专用服务器、LAN 与真实 Provider 的组合实机验证。自动化测试和编译只能验证其覆盖的逻辑与 API 签名。
 
 ---
 
 ## 八、更新日志
 
 > 决策分析（根因、方案论证、取舍）已移至 [docs/design-notes.md](docs/design-notes.md)（[英文版](docs/design-notes_en.md)），本章节只保留纯版本更新。
+
+### 2026-10-26　1.2.0 修复：空间上下文隔离、翻译 API 适配与工程协作规则
+
+- 修复对话成员移动/跨维度后未及时拆分、合并后名单不同步及名单暴露不可听成员的问题；上下文按双方实际收件记录与当前可听关系筛选。
+- 统一所有玩家的服务端空间传播规则，强制纯客户端模式仅切换本地翻译；修复异步结果乱序及旧会话请求回流。
+- 修复翻译缓存忽略上下文、清缓存前的在途请求回填旧结果、非法 Endpoint 同步异常绕过回退的问题；网络错误不再输出可能包含凭据的 URL 或响应正文。
+- 修正 DeepL 中文源语言及繁简目标代码、Free/Pro 自动端点选择；更新 Kimi 的停用默认模型并省略其固定采样温度参数。
+- 修复配置界面草稿在重建/回包后丢失、字段清空无法保存、空模型结果无反馈及模型查询结果写入错误状态等问题。
+- 补充空间上下文、异步顺序、翻译缓存与 Provider 请求、配置草稿及客户端会话状态等回归测试；测试不使用真实付费 Key。
+- 将原“九、已确认规则”迁至 [Agent.md](Agent.md)，新增 [AGENTS.md](AGENTS.md) 发现入口与任务结束检查/提交要求；移除无效的 Gradle 9.4 并行配置，Minecraft 发布基线保持 1.21.1。
+- Java 21 + Gradle 8.8 完整构建通过，61 项自动化测试通过；`build/libs/MCConversationFramework-1.2.0.jar` 可用于独立实例手动测试。本次尚无游戏内实机或真实付费 Provider 验证。
+
+版本号 `1.1.8` → `1.2.0`。本次包含 API 适配及工程规范调整，按项目规则提升 minor。决策分析见 [docs/design-notes.md](docs/design-notes.md)。
 
 ### 2026-08-08　1.1.8 修复：服务端装 MCCF 但客户端没装时消息丢失 + 强制客户端模式下收不到消息
 
@@ -832,84 +848,6 @@ src/client/java/net/mccf/mod/client/
 
 ---
 
-## 九、已确认规则
+## 九、项目协作规则
 
-> 本章节记录与团队/用户对齐过的**稳定规则**，供实现对照，避免后续改动时逻辑漂移。
-> 和"八、更新日志"不同：更新日志是按时间的事件流（谁在什么时候改了什么），
-> 本章节是稳定的约束（代码必须长期遵循的规范）。新规则记入这里之后，
-> 只有在显式声明废弃时才能移除，不能因为某次改动"看起来不需要了"就悄悄省略。
-
-### 9.1 版本号与 README 更新规则
-- **触发条件**：每次完成一个功能或更改后，视情况更新项目版本号，并在 README 更新日志写明本次更改。
-- **版本号位置**：`gradle.properties` 的 `mod_version` 字段。
-- **版本号策略**（语义化版本）：
-  - `patch`（x.y.**Z**）：小 bug 修复、注释修正、文档调整等不影响功能/构建的改动。
-  - `minor`（x.**Y**.0）：新功能、版本切换（如 MC 版本适配）、API 适配修复、构建配置重大调整、工程规范重大变更。
-  - `major`（**X**.0.0）：重大重写、架构变更。
-- **README 更新位置**："八、更新日志"章节，按日期倒序新增条目。
-- **"视情况"判断标准**：
-  - 纯探索性查询、仅读不改 → 不更新版本号，可记可不记 README。
-  - 改了源代码/构建配置/资源文件 → **必须**更新版本号 + 写 README 更新日志。
-  - 只改了 README/注释 → 可只升 patch 并在 README 记一笔，也可不升版本号只记日志。
-- **记入时间**：2026-07-28。
-
-### 9.2 注释风格规范
-本节的规则适用于**所有新写的代码注释和 Javadoc**，改老代码时如果碰到不符合规范的注释
-也应该顺手修正。参考 Claude 的注释风格，核心原则：**注释的价值在于解释"为什么"，
-而不是重复"是什么"**——代码本身已经说明了"是什么"。
-
-#### 9.2.1 注释写"为什么"，不写"是什么"
-- 用**叙述性长句**解释决策动机，而不是干巴巴描述代码行为。
-- 反例：`// 重置血量`
-- 正例：`// 玩家重生后必须显式 setHealth(20.0) 重置血量，因为死亡时残留的"当前血量"
-  会被 RespawnScreen 复用到新角色身上；不能用 heal() 或治疗指令，那会触发 Regen
-  效果的事件链，和"重生瞬间满血"的语义不符；这一步必须在 teleport(toSpawn)
-  之前调用，否则复活点坐标更新后 PlayerEvent.Respawn 已经触发，血量会被
-  respawn 逻辑二次覆盖。`
-
-#### 9.2.2 把决策历史写进注释
-- 遇到曾经改过的逻辑，注释里保留**决策脉络**：谁反馈的、旧版本错在哪、为什么改成现在这样。
-- 团队决定**保留为特性**的部分（不是 bug），要显式声明
-  "此行为经讨论后保留，不再处理"，防止后续接手的人当成 bug 再"修"一遍。
-- 目的：让后人能还原决策过程，而不只是看到当前状态。
-
-#### 9.2.3 类级别声明职责边界
-- 每个**类的 Javadoc 开头**必须明确写："这个类只管 X，不管 Y（那是 Z 类的职责）"。
-- 目的：防止越界改动。如果某个类的方法开始调用它"不该管"的东西，评审时一眼能看出来。
-- 模板：
-  ```java
-  /**
-   * <职责的一句话描述>
-   *
-   * 职责边界：
-   * - 只管：X、Y
-   * - 不管：A（那是 B 类的职责）、C（那是 D 类的职责）
-   */
-  ```
-
-#### 9.2.4 对比论证：非显然的 API 选择必须说明
-- 遇到非显然的 API 选择（比如 `setHealth` vs `damage()`、`teleport` vs 手动构造
-  `TeleportTarget`），在注释里说明**为什么选 A 不选 B**，包括 A 的代价。
-- 模板：`// 这里用 setHealth 而不是 damage()：damage 会触发 LivingEntityDamage 事件，
-  被护甲/药水/模组拦截后扣血量不可控；setHealth 是直接写入，代价是绕过了所有
-  "伤害处理"逻辑（包括死亡判断），所以调用前必须手动检查 currentHealth > 0。`
-- 目的：避免后人"优化"代码时把 A 换成 B，触发当初已经踩过的坑。
-
-#### 9.2.5 版本兼容性踩坑留在注释里
-- 任何因为 MC / Fabric / Yarn 版本差异踩过的坑，都要在**对应代码位置**留注释。
-- 格式：`// 1.21.1 的 DynamicRegistryManager 用 get() 而不是 getOrThrow()
-  （后者是 1.21.5+ 才改的名字）。升级到 1.21.5+ 时这里要同步改名。`
-- 已记入的版本踩坑（供查阅，代码位置也有对应注释）：
-  - `PacketCodecs.BOOL`（1.21.1）↔ `PacketCodecs.BOOLEAN`（1.21.8+）——`RequestConfigPayload.java`
-  - `RenderTickCounter.getTickDelta(boolean)`（1.21.1）↔ `getTickProgress(boolean)`（1.21.8+）——原 `WorldSubtitleRenderer.java`（0.16.0 已删除该文件，但这个版本差异知识点保留：未来若重新引入世界空间渲染会再次踩到）
-  - `HudRenderCallback.EVENT.register`（1.21.1）↔ `HudElementRegistry.addLast`（1.21.6+）——`MCCFClient.java` / `HotbarSubtitleRenderer.java`
-  - `AlwaysSelectedEntryListWidget` 构造器：1.21.1 是 5 参数 `(client, width, height, y, itemHeight)`（第 5 参数即 itemHeight），1.21.8+ 扩为 6 参数 `(client, width, height, y, bottom, itemHeight)`（重新加回 bottom）。**踩坑**：曾误判 1.21.1 第 5 参数为 bottom，把列表高度值传成 itemHeight 导致行高 bug（一句话占满屏），0.7.0 修正——`ModelSelectionScreen.java` / `ChatHistoryScreen.java`
-  - `TextFieldWidget.setRenderTextProvider(BiFunction)`（1.21.1）替代已移除的 `setRenderPasswordReveal(boolean)`（1.20.x 及之前）——`MCCFConfigScreen.java` / `ClientOnlyConfigScreen.java`。1.21.1 没有"一行开启密码框"的开关，需自己传一个把字符替换成圆点的 `BiFunction`。
-  - Java 源码注释中**不要写 `\uXXXX`**：Java 编译器在词法分析阶段（早于注释识别）就会处理 Unicode 转义，注释里的 `\uXXXX` 若 `X` 不是合法十六进制会报"非法的 Unicode 逃逸"。写 Unicode 码点请用 `U+XXXX` 形式——`HttpProviderSupport.java`。
-
-#### 9.2.6 诚实承认不确定性
-- 遇到没查清楚的底层行为，**直接写明**"没查清楚""索性完全绕开"，不要假装完全理解了。
-- 模板：`// 清零 timeUntilRegen 仍不足以保证扣血生效，具体是哪个环节吞掉的没有查清楚
-  （疑似 LivingEntity.damage 里有额外的 invulnerability 检查），索性完全绕开：
-  用 setHealth 直接写入，不依赖 damage 管线。`
-- 目的：让后人知道"这里还有未解之谜，不要盲目重构"，而不是误以为代码已经完全验证过。
+稳定规则已迁至 [Agent.md](Agent.md)；代理发现入口见 [AGENTS.md](AGENTS.md)。

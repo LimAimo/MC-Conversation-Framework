@@ -4,19 +4,9 @@ import java.util.List;
 import java.util.concurrent.CompletableFuture;
 
 /**
- * 可插拔翻译 Provider 接口。
- *
- * 任何翻译后端（OpenAI、Claude、Gemini、DeepL、Google Translate、
- * 本地 Ollama/LM Studio 等）都通过实现这个接口接入 MCCF。
- *
- * 关键设计原则："AI 不是全知"：
- * Provider 收到的 {@link TranslationRequest} 只包含调用方明确传入的上下文
- * （当前 Conversation 内的近期消息），Provider 实现本身不应该、也没有渠道
- * 访问服务器上其他任何数据。上下文边界完全由调用方（TranslationService）
- * 在构造 request 时把控，Provider 只是"纯函数"式的执行者。
- *
- * 所有方法均为异步（返回 CompletableFuture），因为大多数 Provider 会走网络
- * 请求，不能阻塞服务器主线程 / tick 循环。
+ * 只定义翻译后端契约；空间和收件人上下文由 SpatialChatHandler 筛选，缓存和词典由 TranslationService 处理。
+ * 实现应只消费传入数据，不主动读取其他玩家或世界状态；接口本身不是权限隔离沙箱。
+ * 翻译和模型列表使用异步结果，不能阻塞服务器主线程，标识与显示名方法仍同步返回。
  */
 public interface TranslationProvider {
 
@@ -54,13 +44,9 @@ public interface TranslationProvider {
 	 * @param sourceText     原始文本（已经过世界词典占位符预处理）
 	 * @param sourceLang     源语言代码（Minecraft locale 格式，如 "zh_cn"）
 	 * @param targetLang     目标语言代码
-	 * @param contextMessages 当前 Conversation 生命周期内的所有消息，用于帮助
-	 *                        Provider 理解上下文语义（代词指代、术语一致性等）。
-	 *                        这个列表严格限定于"当前对话组内、当前仍在场的
-	 *                        参与者产生的消息"，不会包含服务器上其他任何内容。
-	 *                        0.16.0 起不再做条数截断——整个对话组从创建到 idle
-	 *                        timeout 释放之间的所有发言都会传入（应用户明确要求
-	 *                        "一个 Conversation 从开始到结束作为完整上下文"）。
+     * @param contextMessages 对话历史中双方在发言当时都接收过、且原说话者当前仍可听见的消息。
+     *                        Conversation 保留完整历史，但合组不会授予读取另一组既往消息的权限；
+     *                        纯客户端模式可传空列表。该信息边界由调用方在构造请求前保证。
 	 */
 	record TranslationRequest(
 			String sourceText,

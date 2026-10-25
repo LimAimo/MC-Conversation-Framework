@@ -71,6 +71,9 @@ public class MCCFConfigScreen extends Screen {
 
 	private ServerConfigPanel serverPanel;
 	private LocalConfigPanel localPanel;
+	private final ServerConfigPanel.DraftState serverDrafts = new ServerConfigPanel.DraftState();
+	private final LocalConfigPanel.DraftState localDraft = new LocalConfigPanel.DraftState();
+	private boolean requestedServerSnapshot;
 
 	/** 当前显示哪个面板。默认服务端配置——多数玩家打开设置是为了改服务器上生效的 Provider。 */
 	private Tab activeTab = Tab.SERVER;
@@ -221,14 +224,16 @@ public class MCCFConfigScreen extends Screen {
 
 		// 1.1.3 修复：重建前先从旧 Panel 读出 selectedProvider 保留下来。
 		if (serverPanel != null) {
+			serverPanel.captureDraft();
 			lastSelectedServerProvider = serverPanel.getSelectedProvider();
 		}
 		if (localPanel != null) {
+			localPanel.captureDraft();
 			lastSelectedLocalProvider = localPanel.getSelectedProvider();
 		}
 
 		if (serverTabVisible) {
-			serverPanel = new ServerConfigPanel(this, contentLeft, contentTop, contentRight, contentBottom, this.height / 2);
+			serverPanel = new ServerConfigPanel(this, contentLeft, contentTop, contentRight, contentBottom, this.height / 2, serverDrafts);
 			if (lastSelectedServerProvider != null) {
 				serverPanel.setPreservedSelectedProvider(lastSelectedServerProvider);
 			}
@@ -237,11 +242,15 @@ public class MCCFConfigScreen extends Screen {
 			// ServerPanelVisibility.HIDDEN 时 panel 根本不创建，这里只需转换 READ_ONLY/EDITABLE。
 			serverPanel.setVisibility(visibility == ServerPanelVisibility.READ_ONLY
 					? ProviderConfigPanel.PanelVisibility.READ_ONLY : ProviderConfigPanel.PanelVisibility.EDITABLE);
+			if (!requestedServerSnapshot) {
+				serverPanel.requestSnapshot();
+				requestedServerSnapshot = true;
+			}
 		} else {
 			serverPanel = null;
 		}
 
-		localPanel = new LocalConfigPanel(this, contentLeft, contentTop, contentRight, contentBottom, this.height / 2);
+		localPanel = new LocalConfigPanel(this, contentLeft, contentTop, contentRight, contentBottom, this.height / 2, localDraft);
 		if (lastSelectedLocalProvider != null) {
 			localPanel.setPreservedSelectedProvider(lastSelectedLocalProvider);
 		}
@@ -294,17 +303,22 @@ public class MCCFConfigScreen extends Screen {
 	}
 
 	/** 收到服务端模型列表查询结果后调用。 */
-	public void onModelsResult(boolean success, String providerId, java.util.List<String> models, String error) {
+	public void onModelsResult(boolean success, String requestId, String providerId, java.util.List<String> models, String error) {
 		if (serverPanel != null) {
-			serverPanel.onModelsResult(success, providerId, models, error);
+			serverPanel.onModelsResult(success, requestId, providerId, models, error);
 		}
 	}
 
 	/** ModelSelectionScreen 选中模型后的回调。 */
 	public void setModelFromSelection(String model) {
 		if (serverPanel != null) {
-			serverPanel.setModelFromSelection(model);
+			serverPanel.setModelFromSelection(serverPanel.getSelectedProvider(), model);
 		}
+	}
+
+	/** Route asynchronous local selections to the current widgets after any resize/rebuild. */
+	public void setLocalModelFromSelection(String providerId, String model) {
+		if (localPanel != null) localPanel.setModelFromSelection(providerId, model);
 	}
 
 	@Override

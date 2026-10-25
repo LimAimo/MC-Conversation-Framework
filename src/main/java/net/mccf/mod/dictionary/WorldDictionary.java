@@ -35,8 +35,9 @@ import java.util.regex.Pattern;
 public class WorldDictionary {
 
 	private static final Gson GSON = new GsonBuilder().setPrettyPrinting().create();
-	private static final Path CONFIG_DIR = FabricLoader.getInstance().getConfigDir().resolve(MCCF.MOD_ID);
-	private static final Path DICTIONARY_FILE = CONFIG_DIR.resolve("dictionary.json");
+	private static Path dictionaryFile() {
+		return FabricLoader.getInstance().getConfigDir().resolve(MCCF.MOD_ID).resolve("dictionary.json");
+	}
 
 	/** term -> (langCode -> translation) */
 	private final Map<String, Map<String, String>> entries;
@@ -63,10 +64,16 @@ public class WorldDictionary {
 		this.entries = entries;
 	}
 
+	/** An empty in-memory dictionary, also usable outside a running game. */
+	public WorldDictionary() {
+		this(new LinkedHashMap<>());
+	}
+
 	public static WorldDictionary loadOrCreate() {
+		Path dictionaryFile = dictionaryFile();
 		try {
-			if (Files.exists(DICTIONARY_FILE)) {
-				try (Reader reader = Files.newBufferedReader(DICTIONARY_FILE)) {
+			if (Files.exists(dictionaryFile)) {
+				try (Reader reader = Files.newBufferedReader(dictionaryFile)) {
 					Type type = new TypeToken<LinkedHashMap<String, Map<String, String>>>() {}.getType();
 					Map<String, Map<String, String>> loaded = GSON.fromJson(reader, type);
 					if (loaded != null) {
@@ -75,8 +82,9 @@ public class WorldDictionary {
 					}
 				}
 			}
-		} catch (IOException e) {
-			MCCF.LOGGER.error("[MCCF] Failed to read dictionary, falling back to defaults.", e);
+		} catch (IOException | com.google.gson.JsonParseException e) {
+			MCCF.LOGGER.error("[MCCF] Failed to read dictionary; using defaults in memory and preserving the file.", e);
+			return new WorldDictionary(defaultEntries());
 		}
 
 		WorldDictionary dict = new WorldDictionary(defaultEntries());
@@ -95,9 +103,10 @@ public class WorldDictionary {
 	}
 
 	public void save() {
+		Path dictionaryFile = dictionaryFile();
 		try {
-			Files.createDirectories(CONFIG_DIR);
-			try (Writer writer = Files.newBufferedWriter(DICTIONARY_FILE)) {
+			Files.createDirectories(dictionaryFile.getParent());
+			try (Writer writer = Files.newBufferedWriter(dictionaryFile)) {
 				GSON.toJson(entries, writer);
 			}
 		} catch (IOException e) {

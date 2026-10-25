@@ -2,6 +2,7 @@ package net.mccf.mod;
 
 import net.fabricmc.api.ModInitializer;
 import net.fabricmc.fabric.api.event.lifecycle.v1.ServerTickEvents;
+import net.fabricmc.fabric.api.event.lifecycle.v1.ServerLifecycleEvents;
 import net.fabricmc.fabric.api.message.v1.ServerMessageEvents;
 import net.fabricmc.fabric.api.networking.v1.PayloadTypeRegistry;
 import net.fabricmc.fabric.api.networking.v1.ServerPlayConnectionEvents;
@@ -58,7 +59,7 @@ public class MCCF implements ModInitializer {
 		config = MCCFConfig.loadOrCreate();
 		worldDictionary = WorldDictionary.loadOrCreate();
 
-		// 2. 初始化翻译服务，注册全部内置 Provider（Mock + 7 个真实 API）并激活配置中指定的 Provider。
+		// 2. 初始化翻译服务，注册全部内置 Provider（Mock + 8 个真实 Provider）并激活配置中指定的 Provider。
 		//    每个 Provider 从 config.providers 里读取自己的 API Key/模型/host。
 		translationService = new TranslationService(worldDictionary);
 		registerAllProviders();
@@ -85,15 +86,22 @@ public class MCCF implements ModInitializer {
 
 		// 6. 每 tick 驱动 Conversation 生命周期检查（超时自动释放等）
 		ServerTickEvents.END_SERVER_TICK.register(conversationManager::tick);
+		ServerTickEvents.END_SERVER_TICK.register(chatHandler::tick);
+		ServerLifecycleEvents.SERVER_STOPPED.register(server -> {
+			chatHandler.clear();
+			conversationManager.clear();
+			PlayerLanguageRegistry.clear();
+			ClientOnlyModeRegistry.clear();
+			translationService.clearCache();
+		});
 
 		// 7. 接收客户端语言上报，写入 PlayerLanguageRegistry
 		ServerPlayNetworking.registerGlobalReceiver(LanguageReportPayload.ID, (payload, context) ->
 				PlayerLanguageRegistry.setLanguage(context.player().getUuid(), payload.languageCode()));
 
-		// 7a. 接收客户端模式偏好上报，写入 ClientOnlyModeRegistry。
-		//     用 server.execute 落回主线程再写，避免与 SpatialChatHandler 主线程读取并发读到半状态
-		//     （虽然 ConcurrentHashMap 本身线程安全，但保持单线程写能让后续 SpatialChatHandler 的判定
-		//      与注册表更新之间有明确的 happens-before 关系，调试时也更容易推理）。
+        // Fabric 当前的 play 接收器已在服务器线程回调；显式 execute 仅保留统一调度边界，
+        // 不是补救 ConcurrentHashMap 的“半状态”。模式偏好只改变翻译来源。
+
 		ServerPlayNetworking.registerGlobalReceiver(ModePreferencePayload.ID, (payload, context) -> {
 			var playerId = context.player().getUuid();
 			context.server().execute(() ->
@@ -103,9 +111,8 @@ public class MCCF implements ModInitializer {
 		// 7b. 配置界面：客户端请求快照 -> 服务端按其 op 状态构造并回发
 		ServerPlayNetworking.registerGlobalReceiver(RequestConfigPayload.ID, (payload, context) -> {
 			var player = context.player();
-			String snapshotJson = ConfigSyncHandler.buildSnapshotJson(player, config);
 			context.server().execute(() ->
-					ServerPlayNetworking.send(player, new ConfigSnapshotPayload(snapshotJson)));
+					ConfigSyncHandler.sendSnapshotTo(player, config));
 		});
 
 		// 7c. 配置界面：客户端提交修改 -> 服务端校验 op 权限后应用并保存
@@ -140,8 +147,11 @@ public class MCCF implements ModInitializer {
 		ServerPlayNetworking.registerGlobalReceiver(RequestModelsPayload.ID, (payload, context) -> {
 			var player = context.player();
 			ConfigSyncHandler.handleModelsRequest(player, config, payload.json())
-					.thenAccept(resultJson -> context.server().execute(() ->
-							ServerPlayNetworking.send(player, new ModelsResultPayload(resultJson))));
+					.thenAccept(resultJson -> context.server().execute(() -> {
+						if (player.networkHandler != null && ServerPlayNetworking.canSend(player, ModelsResultPayload.ID)) {
+							ServerPlayNetworking.send(player, new ModelsResultPayload(resultJson));
+						}
+					}));
 		});
 
 		// 8. 玩家加入时主动推送一份配置快照，让 ClientConfigState 立即反映真实服务端状态。
@@ -161,6 +171,7 @@ public class MCCF implements ModInitializer {
 			PlayerLanguageRegistry.remove(playerId);
 			ClientOnlyModeRegistry.remove(playerId);
 			conversationManager.removeParticipant(playerId);
+			chatHandler.removePlayer(playerId);
 		});
 
 		// 9. 注册 /mccf 管理命令
@@ -239,9 +250,8 @@ public class MCCF implements ModInitializer {
 	/**
 	 * 用当前 {@link #config} 里的 Provider 配置（API Key / 模型 / host）
 	 * 重新构造全部 Provider 实例并注册。每次配置界面/命令改动了某个
-	 * Provider 的设置后都应该调用一次，保证正在使用的 Provider 实例
-	 * 反映最新配置（Provider 实例内部持有配置的引用，不是拷贝，所以
-	 * 简单起见这里直接整体重建，逻辑更简单也不容易遗漏）。
+	 * Provider 的设置后都应该调用一次，让新请求使用新的配置对象。
+	 * 在途请求保留当时的 Provider；清缓存代次阻止旧结果回填新缓存。
 	 */
 	public static void registerAllProviders() {
 		translationService.registerProvider(new MockTranslationProvider());

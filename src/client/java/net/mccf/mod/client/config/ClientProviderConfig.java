@@ -37,6 +37,8 @@ public class ClientProviderConfig {
 	 * 修改这个字段，buildUpdateJson 读取它决定发什么给服务端。
 	 */
 	public transient EndpointAction endpointAction = EndpointAction.UNCHANGED;
+	/** Explicit deletion intent; a blank key alone still means keep the saved key. */
+	public transient boolean clearApiKey = false;
 
 	public ClientProviderConfig() {}
 
@@ -48,6 +50,21 @@ public class ClientProviderConfig {
 		// 从服务端快照构造时，默认 UNCHANGED——玩家还没对 endpoint 做任何改动，
 		// 保存时不应该发 endpoint 字段，服务端保持原值即可。
 		this.endpointAction = EndpointAction.UNCHANGED;
+	}
+
+	public ClientProviderConfig copy() {
+		ClientProviderConfig copy = new ClientProviderConfig(apiKey, model, endpoint, isCustomEndpoint);
+		copy.disableThinking = disableThinking;
+		copy.endpointAction = endpointAction;
+		copy.clearApiKey = clearApiKey;
+		return copy;
+	}
+
+	/** Keep runtime Provider configuration in sync with every saved local option. */
+	public net.mccf.mod.config.ProviderConfig toProviderConfig() {
+		var result = new net.mccf.mod.config.ProviderConfig(apiKey, model, endpoint);
+		result.disableThinking = disableThinking;
+		return result;
 	}
 
 	/**

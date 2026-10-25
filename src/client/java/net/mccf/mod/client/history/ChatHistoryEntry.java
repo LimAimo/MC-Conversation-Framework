@@ -7,7 +7,7 @@ import java.util.UUID;
  *
  * 涵盖三类来源，用 {@link Source} 区分（历史界面按来源决定展示样式，
  * 比如"自己发的"不需要显示"⇄"翻译标记）：
- * - SELF：自己发的消息（服务端 dispatchSelfEcho 回显 / 或纯客户端模式下自己发的消息不翻译）。
+ * - SELF：自己发的消息（服务端自身回显 / 或纯客户端模式下自己发的消息不翻译）。
  * - VISIBLE：别人发的、能看到说话者时收到的消息（服务端空间化分发，VISIBLE displayMode）。
  * - AUDIBLE：别人发的、听得到但看不到时收到的消息（AUDIBLE displayMode，物品栏字幕）。
  * - CLIENT_ONLY：纯客户端模式下本地翻译追加的消息（无法区分 VISIBLE/AUDIBLE，因为

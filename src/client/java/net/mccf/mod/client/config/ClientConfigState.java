@@ -9,8 +9,8 @@ import java.util.LinkedHashMap;
 import java.util.Map;
 
 /**
- * 客户端本地保存的配置状态：从服务端快照接收到的数据 + Screen 里正在编辑
- * 但尚未提交的改动。全局单例（客户端同一时刻只会打开一个配置 Screen）。
+ * 当前连接的服务端配置快照。界面尚未保存的修改单独放在
+ * {@link ProviderConfigDrafts}，避免收到快照时覆盖输入。
  *
  * 支持的 Provider 顺序固定，配置 Screen 的"切换 Provider"按钮按这个顺序循环。
  */
@@ -60,14 +60,6 @@ public class ClientConfigState {
 	 * 应保留、后者应跟随。
 	 */
 	public String previousActiveProvider = "mock";
-	/**
-	 * UI 中"待启用"的 Provider：0.10.0 起，玩家点击"保存"时会把当前左侧列表
-	 * 选中查看的 Provider 写入此字段（不再有单独的"设为默认"/"保存并启用"
-	 * 按钮，保存这一个动作同时完成"保存字段改动"和"设为默认"两件事，见
-	 * ServerConfigPanel#onSave）。收到服务端快照后由 applySnapshot 重置为
-	 * 服务端确认值。
-	 */
-	public String pendingActiveProvider = "mock";
 	public final Map<String, ClientProviderConfig> providers = new LinkedHashMap<>();
 
 	/** 是否已经从服务端收到过至少一次快照（用于 Screen 判断是否还在等待数据）。 */
@@ -94,7 +86,6 @@ public class ClientConfigState {
 		// 是否应该让选中框跟随到新 activeProvider（见 previousActiveProvider 字段注释）。
 		this.previousActiveProvider = this.activeProvider;
 		this.activeProvider = root.has("activeProvider") ? root.get("activeProvider").getAsString() : "mock";
-		this.pendingActiveProvider = this.activeProvider;
 
 		providers.clear();
 		if (root.has("providers")) {
@@ -129,6 +120,15 @@ public class ClientConfigState {
 		return providers.computeIfAbsent(providerId, id -> new ClientProviderConfig());
 	}
 
+	/** Configuration and credentials belong to one connection, never the next server. */
+	public void resetConnection() {
+		providers.clear();
+		canEdit = false;
+		hasReceivedSnapshot = false;
+		activeProvider = "mock";
+		previousActiveProvider = "mock";
+	}
+
 	/**
 	 * 构造提交给服务端的 JSON——只包含当前内存里的编辑结果。
 	 *
@@ -138,15 +138,19 @@ public class ClientConfigState {
 	 * 这与旧逻辑（用 isCustomEndpoint + endpoint.isBlank() 自动派生 resetEndpoint）
 	 * 的关键区别在于：旧逻辑无法表达"不改"这个意图。
 	 */
-	public String buildUpdateJson() {
+	public String buildUpdateJson(String providerId, ClientProviderConfig draft) {
 		JsonObject root = new JsonObject();
-		root.addProperty("activeProvider", pendingActiveProvider == null ? activeProvider : pendingActiveProvider);
+		root.addProperty("activeProvider", providerId);
 
 		JsonObject providersJson = new JsonObject();
-		for (Map.Entry<String, ClientProviderConfig> entry : providers.entrySet()) {
+		// Submit only the provider being saved; untouched snapshots must not overwrite another admin's edits.
+		for (Map.Entry<String, ClientProviderConfig> entry : Map.of(providerId, draft).entrySet()) {
 			ClientProviderConfig pc = entry.getValue();
 			JsonObject pcJson = new JsonObject();
 			pcJson.addProperty("apiKey", pc.apiKey == null ? "" : pc.apiKey);
+			if (pc.clearApiKey && (pc.apiKey == null || pc.apiKey.isBlank())) {
+				pcJson.addProperty("clearApiKey", true);
+			}
 			pcJson.addProperty("model", pc.model == null ? "" : pc.model);
 			pcJson.addProperty("disableThinking", pc.disableThinking);
 

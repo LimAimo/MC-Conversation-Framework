@@ -12,24 +12,22 @@ import java.util.List;
 import java.util.UUID;
 
 /**
- * 服务端 -> 客户端：同步某个 Conversation 当前的完整参与者名单（UUID + 显示名）。
+ * 这个类只管服务端到客户端的名单编解码及输入边界，不决定参与者或接收范围；
+ * SpatialChatHandler 只发送收件人当前听力范围内的名单。
  *
- * 为什么不把参与者名单直接塞进 {@link SubtitlePayload}：那个包的字段数已经
- * 用满（{@code PacketCodec} 手写 encode/decode 的做法本身没有硬性字段数限制，
- * 但每条消息都携带完整参与者名单会造成明显的带宽浪费——一个活跃的 5 人对话组
+ * 名单独立于 {@link SubtitlePayload}，因为每条消息都携带完整名单会造成带宽浪费——一个活跃的 5 人对话组
  * 每人每次发言都要重复广播全部 5 个人的 UUID+名字，而这份名单在多数时候
  * 相邻两次发言之间根本没有变化）。改为独立的包，只在参与者集合真正发生变化
- * （有人加入/离开这个 Conversation）时才发送一次，收件人是"变化后仍在这个
- * Conversation 里的所有参与者"。
+ * 或收件人可听见的成员范围变化时才发送一次；每个收件人的名单分别筛选，
+ * 不能因为同属一个连通组就获得远处成员的身份。
  *
  * 客户端收到后更新本地"conversationId -> 参与者名单"的映射（见客户端
  * ChatHistoryManager 相关逻辑），聊天历史记录界面据此渲染大标题
  * （"LimAimo、test、Alex 的对话"）和"XX 加入了对话"提示。
  *
  * @param conversationId 对应服务端 {@link net.mccf.mod.context.Conversation} 的 id
- * @param participantIds   当前参与者 UUID 列表，顺序即为服务端 Set 的遍历顺序
- *                          （{@code LinkedHashSet}，插入顺序——也就是"谁先加入对话
- *                          的顺序"，客户端渲染大标题时按这个顺序列名字，符合直觉）
+ * @param participantIds   收件人自身优先，之后按组内插入顺序列出当前可听的参与者；
+ *                         发送端最多 128 人，以兼容相同频道下的旧客户端解码器
  * @param participantNames 与 participantIds 一一对应的显示名列表，长度必须相同
  */
 public record ConversationRosterPayload(
@@ -39,7 +37,9 @@ public record ConversationRosterPayload(
 ) implements CustomPayload {
 
 	/** 单个 Conversation 参与者数量上限，防御性限制，避免恶意/异常数据构造超大包。 */
-	private static final int MAX_PARTICIPANTS = 128;
+	// 新解码器允许有界的较大名单；实际发送仍截为旧协议的 128 人，
+	// 因为频道没有能力协商，不能把新解码上限当成旧客户端可接受的数量。
+	public static final int MAX_PARTICIPANTS = 1024;
 
 	public ConversationRosterPayload {
 		if (participantIds.size() != participantNames.size()) {
@@ -52,17 +52,15 @@ public record ConversationRosterPayload(
 					"ConversationRosterPayload participant count exceeds max " + MAX_PARTICIPANTS +
 					" (was " + participantIds.size() + ")");
 		}
+		participantIds = List.copyOf(participantIds);
+		participantNames = List.copyOf(participantNames);
 	}
 
 	public static final CustomPayload.Id<ConversationRosterPayload> ID =
 			new CustomPayload.Id<>(Identifier.of(MCCF.MOD_ID, "conversation_roster"));
 
-	// 同 SubtitlePayload：手写 encode/decode 而不是 PacketCodec.tuple(...)，避免
-	// 依赖不确定的重载数量。List 字段的编解码同样不借助 PacketCodecs 里可能存在
-	// 也可能不存在的集合包装工具方法（没有本地反编译源码可核对具体方法名），
-	// 改为最基础、确定存在的手写循环：先写入元素个数（varInt，Minecraft 协议里
-	// 长期稳定使用的变长整数编码，RegistryByteBuf 作为 Netty ByteBuf 的扩展
-	// 具备 writeVarInt/readVarInt 是有把握的），再逐个 encode/decode 每个元素。
+	// 手写计数和列表循环，使分配之前的边界检查与线上字段顺序集中可见，
+	// 避免调整集合工具方法时意外改变现有协议。
 	public static final PacketCodec<RegistryByteBuf, ConversationRosterPayload> CODEC = PacketCodec.of(
 			(payload, buf) -> {
 				Uuids.PACKET_CODEC.encode(buf, payload.conversationId());
@@ -82,12 +80,8 @@ public record ConversationRosterPayload(
 			buf -> {
 			UUID conversationId = Uuids.PACKET_CODEC.decode(buf);
 
-			// 1.1.2 安全修复：readVarInt 返回值必须在上限校验**之前**使用——
-			// 旧代码直接把 idCount 传给 new ArrayList<>(idCount)，恶意客户端
-			// 发送 idCount=Integer.MAX_VALUE 会预分配约 16GB 内存直接 OOM 服务端。
-			// 上限校验放在 ArrayList 构造之前，先 clamp 到 MAX_PARTICIPANTS 再预分配容量。
-			// nameCount 同理处理。校验失败时抛 IllegalArgumentException 会被 Fabric
-			// 的 Payload 反序列化层捕获并丢弃该包（不会让服务端崩溃），等价于"无视恶意包"。
+			// 名单是 S2C 包；先校验长度再分配，避免异常服务端让客户端预分配无界内存。
+			// 非法包抛异常交给网络层处理，不能假定网络层一定静默丢弃而不会断开连接。
 			int idCount = buf.readVarInt();
 			if (idCount < 0 || idCount > MAX_PARTICIPANTS) {
 				throw new IllegalArgumentException(

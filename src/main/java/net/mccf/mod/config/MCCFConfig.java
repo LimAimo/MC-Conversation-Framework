@@ -14,7 +14,8 @@ import java.util.LinkedHashMap;
 import java.util.Map;
 
 /**
- * MCCF 服务端配置。管理员可修改 config/mccf/config.json 来调整行为，
+ * 只管服务端配置的默认值、校验和读写，不管权限与网络同步（由 ConfigSyncHandler 处理）。
+ * 管理员可修改 config/mccf/config.json 来调整行为，
  * 也可以通过游戏内配置界面（ModMenu 集成 / 按键呼出）修改，二者共用同一份文件。
  *
  * 所有距离数值都以"格"（block）为单位，与 Minecraft 原版距离单位一致。
@@ -22,8 +23,9 @@ import java.util.Map;
 public class MCCFConfig {
 
 	private static final Gson GSON = new GsonBuilder().setPrettyPrinting().create();
-	private static final Path CONFIG_DIR = FabricLoader.getInstance().getConfigDir().resolve(MCCF.MOD_ID);
-	private static final Path CONFIG_FILE = CONFIG_DIR.resolve("config.json");
+	private static Path configFile() {
+		return FabricLoader.getInstance().getConfigDir().resolve(MCCF.MOD_ID).resolve("config.json");
+	}
 
 	/**
 	 * "看得见说话者"的距离阈值，单位：格。在此距离内且视线未被方块阻挡的听众归为
@@ -42,7 +44,7 @@ public class MCCFConfig {
 
 	/**
 	 * 加入 / 保留在 Conversation 中所需的最大距离。
-	 * 必须 <= hearingRange，否则会出现"能听到但不在任何对话组"的悖论状态。
+	 * 不超过 hearingRange；更远但仍可听的玩家仍收到消息，只不因这次发言加入该组。
 	 */
 	public double conversationRange = 48.0;
 
@@ -56,7 +58,7 @@ public class MCCFConfig {
 	public String activeProvider = "mock";
 
 	/**
-	 * 每个 Provider 的独立配置（API Key / 模型名 / host），key 为 Provider ID。
+	 * 每个 Provider 的独立配置（API Key / 模型名 / endpoint），key 为 Provider ID。
 	 * 即使某个 Provider 当前未激活，它的配置也会保留在这里，方便随时切换。
 	 */
 	public Map<String, ProviderConfig> providers = defaultProviderConfigs();
@@ -65,7 +67,8 @@ public class MCCFConfig {
 		Map<String, ProviderConfig> map = new LinkedHashMap<>();
 		for (String id : ProviderDefaults.all().keySet()) {
 			ProviderDefaults.Defaults d = ProviderDefaults.get(id);
-			map.put(id, new ProviderConfig("", d.model(), d.endpoint()));
+			// 空值保留“自动选择”的含义，尤其 DeepL 要按 Key 类型决定免费/付费端点。
+			map.put(id, new ProviderConfig("", d.model(), ""));
 		}
 		return map;
 	}
@@ -76,9 +79,10 @@ public class MCCFConfig {
 	}
 
 	public static MCCFConfig loadOrCreate() {
+		Path configPath = configFile();
 		try {
-			if (Files.exists(CONFIG_FILE)) {
-				try (Reader reader = Files.newBufferedReader(CONFIG_FILE)) {
+			if (Files.exists(configPath)) {
+				try (Reader reader = Files.newBufferedReader(configPath)) {
 					MCCFConfig loaded = GSON.fromJson(reader, MCCFConfig.class);
 					if (loaded != null) {
 						if (loaded.providers == null) {
@@ -88,18 +92,20 @@ public class MCCFConfig {
 							defaultProviderConfigs().forEach(loaded.providers::putIfAbsent);
 						}
 						loaded.validateAndClamp();
-						MCCF.LOGGER.info("[MCCF] Loaded config from {}", CONFIG_FILE);
+						MCCF.LOGGER.info("[MCCF] Loaded config from {}", configPath);
 						return loaded;
 					}
 				}
 			}
-		} catch (IOException e) {
-			MCCF.LOGGER.error("[MCCF] Failed to read config, falling back to defaults.", e);
+		} catch (IOException | RuntimeException e) {
+			MCCF.LOGGER.error("[MCCF] Config could not be read ({}); retaining the original file and using defaults in memory.",
+					e.getClass().getSimpleName());
 		}
 
 		MCCFConfig defaults = new MCCFConfig();
 		defaults.validateAndClamp();
-		defaults.save();
+		// 损坏文件可能仍含可恢复的 Key，不用默认值覆盖它；仅首次缺文件时自动创建。
+		if (!Files.exists(configPath)) defaults.save();
 		return defaults;
 	}
 
@@ -111,19 +117,40 @@ public class MCCFConfig {
 	 * 一路抛到 ModInitializer.onInitialize 导致整个模组加载失败），clamp
 	 * 到合法值更友好——服务器能正常启动，日志里会有警告提醒管理员修正。
 	 */
-	private void validateAndClamp() {
+	void validateAndClamp() {
+		if (!Double.isFinite(hearingRange) || hearingRange < 0) hearingRange = 48.0;
+		if (!Double.isFinite(subtitleVisibleRange) || subtitleVisibleRange < 0) subtitleVisibleRange = 32.0;
+		if (!Double.isFinite(conversationRange) || conversationRange < 0) conversationRange = 48.0;
+		subtitleVisibleRange = Math.min(subtitleVisibleRange, hearingRange);
+		if (conversationIdleTimeoutSeconds <= 0) conversationIdleTimeoutSeconds = 120;
+		if (activeProvider == null || !ProviderDefaults.all().containsKey(activeProvider)) activeProvider = "mock";
+		if (providers == null) providers = defaultProviderConfigs();
+		providers.entrySet().removeIf(entry -> entry.getValue() == null);
+		defaultProviderConfigs().forEach(providers::putIfAbsent);
+		providers.forEach((id, provider) -> {
+			if (provider.apiKey == null) provider.apiKey = "";
+			if (provider.model == null) provider.model = ProviderDefaults.get(id).model();
+			if (provider.endpoint == null) provider.endpoint = "";
+			if ("kimi".equals(id) && "kimi-k2.5".equals(provider.model)
+					&& (provider.endpoint.isBlank() || provider.endpoint.equals("https://api.moonshot.ai")
+					|| provider.endpoint.equals("https://api.moonshot.cn"))) {
+				// 只迁移官方已停用的默认模型，反代提供的同名私有模型不擅自替换。
+				provider.model = ProviderDefaults.get("kimi").model();
+			}
+		});
 		if (conversationRange > hearingRange) {
 			MCCF.LOGGER.warn("[MCCF] conversationRange ({}) > hearingRange ({}), clamping conversationRange to hearingRange. " +
-					"能听到但不在对话组的悖论状态已通过 clamp 规避，请检查 config.json。",
+					"The conversation grouping range cannot exceed the hearing range.",
 					conversationRange, hearingRange);
 			conversationRange = hearingRange;
 		}
 	}
 
 	public void save() {
+		Path configPath = configFile();
 		try {
-			Files.createDirectories(CONFIG_DIR);
-			try (Writer writer = Files.newBufferedWriter(CONFIG_FILE)) {
+			Files.createDirectories(configPath.getParent());
+			try (Writer writer = Files.newBufferedWriter(configPath)) {
 				GSON.toJson(this, writer);
 			}
 		} catch (IOException e) {

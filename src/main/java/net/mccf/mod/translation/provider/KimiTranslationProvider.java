@@ -9,15 +9,12 @@ import java.util.concurrent.CompletableFuture;
 /**
  * Kimi (Moonshot AI) 翻译 Provider。
  *
- * Kimi 的 API 与 OpenAI Chat Completions 完全兼容（官方文档：只需替换
- * base_url 和 api_key，其余代码不用改），因此直接复用
- * {@link ChatCompletionsSupport} 的请求构造 / 响应解析逻辑。
+ * 使用 OpenAI Chat Completions 格式，并按 Kimi 的模型约束省略固定采样参数。
  *
- * 默认模型 kimi-k2.5 支持 {@code "thinking":{"type":"disabled"}} 关闭思考
- * （{@code config.disableThinking} 为 true 时会带上这个参数）。**重要限制**：
- * 如果玩家把模型手动改成 K3 系列，官方文档明确写"Reasoning is always on.
- * There is no non-thinking mode."——传这个参数不会报错，但也不会真正关闭
- * 思考，K3 强制思考是 API 本身的限制，不是这个开关失效。
+ * 默认模型 kimi-k2.6 支持关闭思考。K2.5 已于 2026-08-31 下线。
+ * Kimi 当前模型的采样温度由模型/思考模式固定，因此请求中省略 temperature。
+ * K2.7/K3 系列无法关闭思考，不向这些模型发送 disabled thinking 参数。
+ * 约束来源：https://platform.kimi.ai/docs/api/models-overview
  *
  * Endpoint: POST https://api.moonshot.ai/v1/chat/completions
  * Auth: Authorization: Bearer <key>
@@ -39,7 +36,7 @@ public class KimiTranslationProvider implements TranslationProvider {
 
 	@Override
 	public String getDisplayName() {
-		return "Kimi / Moonshot AI (" + (config.model.isBlank() ? "kimi-k2.5" : config.model) + ")";
+		return "Kimi / Moonshot AI (" + effectiveModel() + ")";
 	}
 
 	@Override
@@ -48,16 +45,22 @@ public class KimiTranslationProvider implements TranslationProvider {
 			return CompletableFuture.failedFuture(new IllegalStateException("Kimi API key not configured"));
 		}
 
-		String model = config.model.isBlank() ? "kimi-k2.5" : config.model;
+		String model = effectiveModel();
 		String endpoint = ChatCompletionsSupport.stripTrailingSlash(config.effectiveEndpoint(ID)) + "/v1/chat/completions";
 		String systemPrompt = ChatCompletionsSupport.buildSystemPrompt(request);
-		String body = ChatCompletionsSupport.buildRequestBody(model, systemPrompt, request.sourceText(), config.disableThinking);
+		boolean disableThinking = config.disableThinking && model.equals("kimi-k2.6");
+		String body = ChatCompletionsSupport.buildRequestBodyWithDefaultSampling(
+				model, systemPrompt, request.sourceText(), disableThinking);
 
 		return HttpProviderSupport.postJson(endpoint, body, Map.of(
 				"Authorization", "Bearer " + config.apiKey,
 				"Content-Type", "application/json"
 		)).thenApply(ChatCompletionsSupport::parseChatCompletionResponse)
 				.thenApply(TranslationResult::new);
+	}
+
+	private String effectiveModel() {
+		return config.model == null || config.model.isBlank() ? "kimi-k2.6" : config.model;
 	}
 
 	@Override
